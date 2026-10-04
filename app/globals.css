@@ -1,0 +1,111 @@
+@import "tailwindcss";
+@import "@fontsource/atkinson-hyperlegible/400.css";
+@import "@fontsource/atkinson-hyperlegible/700.css";
+
+/*
+ * Palette: study desk under a lamp. Fountain-pen blue ink on cool paper,
+ * highlighter yellow for the things you mark (numbers, stars).
+ */
+:root {
+  --bg: #eef1f6;
+  --surface: #ffffff;
+  --sunken: #e3e8f0;
+  --ink: #172340;
+  --muted: #586380;
+  --line: #d3d9e4;
+  --accent: #2747c7;
+  --on-accent: #ffffff;
+  --mark: #ffd43b;
+  --on-mark: #2b2300;
+  --ok: #18794e;
+  --bad: #c2362b;
+  --part: #a35f00;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1420;
+    --surface: #182033;
+    --sunken: #121929;
+    --ink: #e7ebf3;
+    --muted: #9aa4bc;
+    --line: #2a3450;
+    --accent: #8aa4ff;
+    --on-accent: #0f1420;
+    --mark: #f5c518;
+    --on-mark: #2b2300;
+    --ok: #4cc38a;
+    --bad: #ff6b5e;
+    --part: #f0a33a;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --font-sans: "Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-mark: var(--mark);
+  --color-on-mark: var(--on-mark);
+  --color-ok: var(--ok);
+  --color-bad: var(--bad);
+  --color-part: var(--part);
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-tap-highlight-color: transparent;
+}
+
+@layer components {
+  .btn, .btn-primary, .btn-secondary, .btn-danger {
+    @apply inline-flex min-h-12 items-center justify-center gap-2 rounded-xl px-4 font-bold
+      transition-colors disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2
+      focus-visible:outline-accent;
+  }
+  .btn-primary { @apply bg-accent text-on-accent active:opacity-90; }
+  .btn-secondary { @apply border border-line bg-surface text-ink active:bg-sunken; }
+  .btn-danger { @apply border border-line bg-surface text-bad active:bg-sunken; }
+  .btn-icon {
+    @apply inline-flex size-11 items-center justify-center rounded-full text-muted active:bg-sunken
+      focus-visible:outline-2 focus-visible:outline-accent;
+  }
+  .field {
+    @apply min-h-12 w-full rounded-xl border border-line bg-surface px-3 text-base text-ink
+      placeholder:text-muted focus:border-accent focus:outline-none;
+  }
+  .chip {
+    @apply inline-flex min-h-10 items-center gap-1.5 rounded-full border border-line bg-surface px-4
+      text-sm font-bold text-muted transition-colors;
+  }
+  .chip[aria-pressed="true"],
+  .chip[aria-checked="true"] {
+    @apply border-accent bg-accent text-on-accent;
+  }
+  .card { @apply rounded-2xl border border-line bg-surface; }
+
+  /* The signature: question numbers look highlighted with a marker. */
+  .qnum {
+    @apply inline-block px-1.5 font-bold text-on-mark;
+    background: linear-gradient(
+      100deg,
+      transparent 0 2%,
+      var(--mark) 4% 96%,
+      transparent 98%
+    );
+    border-radius: 3px 6px 4px 7px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
