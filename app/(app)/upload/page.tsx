@@ -75,10 +75,11 @@ function UploadInner() {
   const patch = (key: string, p: Partial<Item>) =>
     setItems((list) => list.map((i) => (i.key === key ? { ...i, ...p } : i)));
 
-  async function handleFiles(files: FileList | null) {
-    if (!files?.length || !picked.chapterId) return;
+  // Takes a plain array: the input's FileList is emptied when the input is reset.
+  async function handleFiles(files: File[]) {
+    if (!files.length || !picked.chapterId) return;
     setError(null);
-    const batch: Item[] = Array.from(files).map((f) => ({ key: uuid(), name: f.name || "Photo", state: "waiting" }));
+    const batch: Item[] = files.map((f) => ({ key: uuid(), name: f.name || "Photo", state: "waiting" }));
     setItems((list) => [...batch, ...list]);
     setBusy(true);
     localStorage.setItem(LAST_PICK, JSON.stringify(picked));
@@ -89,7 +90,6 @@ function UploadInner() {
       userId = await currentUserId();
       if (!sectionId) {
         sectionId = await ensureGeneralSection(picked.chapterId);
-        setPicked((p) => ({ ...p, sectionId }));
       }
     } catch (e) {
       batch.forEach((b) => patch(b.key, { state: "error", error: (e as Error).message }));
@@ -98,7 +98,7 @@ function UploadInner() {
     }
 
     // One page at a time: keeps memory low on phones.
-    for (const [i, file] of Array.from(files).entries()) {
+    for (const [i, file] of files.entries()) {
       const key = batch[i].key;
       try {
         patch(key, { state: "preparing" });
@@ -175,8 +175,9 @@ function UploadInner() {
           capture="environment"
           hidden
           onChange={(e) => {
-            void handleFiles(e.target.files);
-            e.target.value = "";
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = ""; // lets you pick the same photo again
+            void handleFiles(files);
           }}
         />
         <input
@@ -186,8 +187,9 @@ function UploadInner() {
           multiple
           hidden
           onChange={(e) => {
-            void handleFiles(e.target.files);
-            e.target.value = "";
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = ""; // lets you pick the same photo again
+            void handleFiles(files);
           }}
         />
 
