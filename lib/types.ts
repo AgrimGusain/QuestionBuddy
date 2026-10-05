@@ -1,3 +1,4 @@
+import type { KeyAiResult } from "./answer-key/schema";
 import type { AiResult } from "./segment/schema";
 
 export type QuestionType = "mcq" | "msq" | "numerical" | "theory";
@@ -23,7 +24,8 @@ export interface PageRow {
   processed_path: string | null;
   retry_after: string | null;
   retry_count: number;
-  ai_result: AiResult | null;
+  /** Question pages: AiResult. Answer-key pages: KeyAiResult (kind: "answer_key"). */
+  ai_result: AiResult | KeyAiResult | null;
   ai_model: string | null;
   ai_processed_at: string | null;
   error: string | null;
@@ -57,6 +59,31 @@ export interface Answer {
   correct_options: string[] | null;
   numeric_min: number | string | null; // Postgres numeric may arrive as a string
   numeric_max: number | string | null;
+  /** The answer-key page this came from; null = typed (or edited) by hand. */
+  source_page_id: string | null;
+}
+
+export type AnswerEntryStatus = "unmatched" | "matched" | "conflict" | "ignored" | "kept_mine";
+
+export interface AnswerKeyEntry {
+  id: string;
+  page_id: string;
+  chapter_id: string;
+  section_id: string | null;
+  number: string;
+  number_normalized: string;
+  kind: "short" | "worked";
+  raw_text: string;
+  correct_options: string[] | null;
+  numeric_min: number | string | null;
+  numeric_max: number | string | null;
+  answer_text: string | null;
+  parse_flags: string[];
+  image_path: string | null;
+  status: AnswerEntryStatus;
+  question_id: string | null;
+  conflict_reason: string | null;
+  created_at: string;
 }
 
 /** Row of the question_overview view. */

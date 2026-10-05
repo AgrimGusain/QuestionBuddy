@@ -9,6 +9,7 @@ import { ErrorNote, Loading } from "@/components/Status";
 import { TopBar } from "@/components/TopBar";
 import { useSignedUrls } from "@/components/useSignedUrls";
 import { ZoomPane } from "@/components/ZoomPane";
+import { isKeyResult } from "@/lib/answer-key/schema";
 import { deleteWithFiles } from "@/lib/delete";
 import { loadHierarchy, pathLabel, type Hierarchy } from "@/lib/hierarchy";
 import { nextQuestionNumber, normalizeQuestionNumber } from "@/lib/number";
@@ -88,7 +89,7 @@ function readDraft(pageId: string): DraftBox[] | null {
 
 /** The model's boxes, with a first block that continues an earlier page pointed at that page's last question. */
 async function initialBoxes(page: PageRow): Promise<DraftBox[]> {
-  if (!page.ai_result) return [];
+  if (!page.ai_result || isKeyResult(page.ai_result)) return [];
   const boxes = boxesFromAi(page.ai_result, getSnapDisplay());
   const first = boxes[0];
   if (first?.flags?.continuesFromPrevious && page.section_id) {
@@ -204,6 +205,11 @@ export default function ReviewPage() {
         if (res.error) throw new Error(res.error.message);
         const p = res.data as PageRow | null;
         if (!live) return;
+        // Answer-key pages have their own review screen.
+        if (p?.kind === "answer_key") {
+          router.replace(`/upload/key/${pageId}`);
+          return;
+        }
         setPage(p);
         setH(hier);
         const draft = readDraft(pageId);

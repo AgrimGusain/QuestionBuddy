@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { OptionPad } from "@/components/OptionPad";
 import { ShareButtons } from "@/components/ShareButtons";
+import { SolutionImage } from "@/components/SolutionImage";
 import { ErrorNote, Loading } from "@/components/Status";
 import { TopBar } from "@/components/TopBar";
 import { canAutoGrade, formatAnswer, gradeMcq, gradeMsq, gradeNumeric, numericRange, parseUserNumber } from "@/lib/grading";
@@ -265,6 +266,7 @@ export default function PracticeSessionPage() {
             <h2 className="font-bold">Answer</h2>
             {stored && <p className="text-xl font-bold">{stored}</p>}
             {answer?.answer_text && <p className="whitespace-pre-wrap">{answer.answer_text}</p>}
+            {answer?.answer_image_path && <SolutionImage path={answer.answer_image_path} number={q.number} />}
             {!answer && (
               <p className="text-muted">
                 No answer saved for this question.{" "}

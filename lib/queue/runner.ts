@@ -30,7 +30,6 @@ async function tick(): Promise<void> {
   const { data: candidate } = await supabase()
     .from("pages")
     .select("id")
-    .eq("kind", "questions")
     .or(
       `status.eq.queued,` +
         `and(status.eq.rate_limited,retry_after.is.null),` +

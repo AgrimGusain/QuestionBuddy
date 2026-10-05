@@ -1,4 +1,4 @@
-# Snap Question Bank — Phases 1–2
+# Snap Question Bank — Phases 1–3
 
 Photograph textbook pages, box each question, and build a searchable bank you can practise from.
 
@@ -9,7 +9,12 @@ practice and theory revision with auto-checking or self-marking, session summari
 Phase 2 adds auto-snipping: flatten the photo, let Gemini find every question, snap the boxes to clean
 edges, let a Groq vision model read each question's text and options from its crop, then review and fix
 them before saving. Drawing
-boxes by hand still works on every page. Answer-key pages keep the Phase 1 manual flow for now.
+boxes by hand still works on every page.
+
+Phase 3 reads answer keys: answer-key pages go through the same capture and queue, Gemini finds the
+short-answer tables, worked solutions and headings, Qwen reads them, you review the entries, and saving
+matches them to questions by chapter + section + number (in SQL). A matching summary per chapter shows
+conflicts, answers with no question, and questions with no answer.
 
 ## Setup
 
@@ -21,6 +26,7 @@ boxes by hand still works on every page. Answer-key pages keep the Phase 1 manua
    - `supabase/migrations/20261005000000_phase2_ai_queue.sql`
    - `supabase/migrations/20261005000100_ai_progress.sql`
    - `supabase/migrations/20261005000200_theory_type_tags.sql`
+   - `supabase/migrations/20261006000000_phase3_answer_keys.sql`
 
 3. **Create your account.** Authentication → Users → Add user → enter email and password,
    tick "Auto confirm user". Then Authentication → Sign In / Providers → turn off
@@ -44,7 +50,7 @@ boxes by hand still works on every page. Answer-key pages keep the Phase 1 manua
    ```bash
    npm install
    npm run dev        # http://localhost:3000
-   npm test           # unit tests (Gemini and Groq are mocked; no keys needed)
+   npm test           # unit tests (Gemini and Groq are mocked; no keys needed) plus SQL tests on PGlite
    ```
 
 ## Testing on your phone
@@ -108,6 +114,30 @@ your host allows that.
   from the raw boxes.
 - **Answer-key pages** still upload straight to "needs review" and never go through the AI queue.
 
+## Phase 3 test checklist
+
+- **Upload:** "Answer key pages" is enabled. Leave the section empty for a key that covers several
+  sections. Same corner-adjust screen; the page shows "Reading…" under Pages, then "Review answers".
+- **Short keys:** a table like "1. (d)  2. (5) … 31. (a; c)" comes back as one entry per number, each
+  showing what was read and what it means ("(3)" → "c or 3"). Numbers the model missed are listed
+  above the page ("couldn't read 7, 14") — add them with "+ Entry".
+- **Worked solutions:** each gets a numbered box; move/resize/split it, or give two boxes the same
+  number to join a solution that runs into the next column. Its text shows under the thumbnail.
+- **Sections:** headings like "Exercise 1" are mapped to sections with the same name; change the
+  mapping, set a range ("1 to 36 → Exercise 1"), or change one entry. Save is blocked until every
+  entry that isn't ignored has a section.
+- **Save:** then "See what matched". Matched questions show the key's answer (and solution image) on
+  the question page and in practice.
+- **Key before questions:** save a key page first, then the question page: the answers appear on the
+  questions as soon as they're saved.
+- **Conflicts:** type your own answer on a question, then save a key that disagrees: the summary shows
+  both. "Use key answer" replaces yours; "Keep mine" keeps it (listed under "Kept your answer", with
+  Undo). An MCQ whose key gives two options offers "Change question to MSQ".
+- **Renumber / retype:** change a question's number or type on its page: its key answer follows (or
+  goes, if the key has nothing for the new number). Answers you edited by hand never change.
+- **Delete a key page:** the answers it gave that you haven't edited disappear; edited ones stay.
+- **Manual entry:** if reading fails, "Enter answers manually" opens the same screen to type entries.
+
 ## How things fit together
 
 - **Photos never get lost.** The resized original (JPEG, long edge ≤ 2400px, quality 0.85) is uploaded
@@ -131,6 +161,27 @@ your host allows that.
   read so far). A rate limit or the route's 40s read budget saves it and stops; the next attempt skips
   straight to the next unread question. `pages.ai_result` (raw and snapped boxes, text, flags) is
   written only when every question is read, since the review screen shows whatever is there.
+- **Answer keys** (`lib/answer-key/`). The segment route sends answer-key pages to `pipeline.ts`:
+  `locateAnswerKey` (Gemini: headings, short-answer tables with rows/columns/first/last number, worked
+  solutions), then `readKeyEntries` per table — whole when it holds ≤45 entries, otherwise split at the
+  whitespace between rows (`chunks.ts`), with one targeted re-read of missing numbers — then
+  `readWorkedSolution` per solution box. Output caps are sized per call (~16 tokens per entry), since
+  Groq counts the cap against the free tier's 1,000 output tokens/min. Progress resumes via
+  `pages.ai_progress` like question pages. The model only copies text; `parse.ts` decides what an
+  answer means ("(3)" keeps both readings — option c and the number 3 — and the question's type
+  picks). The review screen's rules live in `review.ts`; section assignment from headings in
+  `sections.ts`.
+- **Matching** is `match_answer_key_entries(chapter)` in SQL, run after a key page is saved, after
+  questions are saved (inside `save_page_questions`), and when a question is renumbered, retyped or
+  deleted. It takes a per-chapter advisory lock, recomputes every entry except `ignored` / `kept_mine`
+  (the user's decisions), deletes stale key answers, and inserts answers with `on conflict do nothing`.
+  It never overwrites an answer with `source_page_id = null` (typed by hand — `AnswerEditor` clears
+  `source_page_id` on save). Solution crops live at `crops/<user>/keys/<page>/<entry>.jpg`, owned by
+  their entry; `delete_answer_key_page()` removes the answers a key page wrote (unless edited) and
+  returns the images nothing uses any more.
+- **SQL tests** (`supabase/tests/`) run every migration on PGlite (in-process Postgres) with small
+  stand-ins for Supabase's auth/storage, as a signed-in user so RLS applies. PGlite is one connection,
+  so concurrency (the advisory lock) is not tested there.
 - **Saving a page** (`app/api/pages/[pageId]/save/route.ts`) crops each box with sharp (+2% padding)
   from the flattened copy when there is one (that's what the boxes were drawn on), uploads crops to
   `crops/<user>/<question>/…`, then calls `save_page_questions()`, which inserts all questions (with

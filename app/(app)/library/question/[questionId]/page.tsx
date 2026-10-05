@@ -8,6 +8,7 @@ import { ShareButtons } from "@/components/ShareButtons";
 import { ErrorNote, Loading } from "@/components/Status";
 import { TopBar } from "@/components/TopBar";
 import { useSignedUrls } from "@/components/useSignedUrls";
+import { rematch } from "@/lib/answer-key/client";
 import { deleteWithFiles } from "@/lib/delete";
 import { loadHierarchy, pathLabel, type Hierarchy } from "@/lib/hierarchy";
 import { supabase } from "@/lib/supabase/client";
@@ -23,6 +24,8 @@ export default function QuestionPage() {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  // Bumped when matching may have changed the answer, so the editor reloads it.
+  const [answerVersion, setAnswerVersion] = useState(0);
 
   useEffect(() => {
     const db = supabase();
@@ -46,6 +49,8 @@ export default function QuestionPage() {
   }, [questionId]);
 
   const urls = useSignedUrls("crops", q?.image_paths ?? []);
+  const solutionUrls = useSignedUrls("crops", answer?.answer_image_path ? [answer.answer_image_path] : []);
+  const solutionUrl = answer?.answer_image_path ? solutionUrls[answer.answer_image_path] : undefined;
   const orderedUrls = (q?.image_paths ?? []).map((p) => urls[p]).filter(Boolean);
 
   async function update(patch: Partial<Question>) {
@@ -59,6 +64,20 @@ export default function QuestionPage() {
       return false;
     }
     setError(null);
+    // Answer keys match on number and read answers by type: match this chapter again.
+    const chapterId = h?.sections.find((s) => s.id === q.section_id)?.chapter_id;
+    if (chapterId && ("number" in patch || "type" in patch)) {
+      try {
+        await rematch(chapterId);
+        const fresh = await supabase().from("answers").select("*").eq("question_id", q.id).maybeSingle();
+        if (!fresh.error) {
+          setAnswer(fresh.data as Answer | null);
+          setAnswerVersion((v) => v + 1);
+        }
+      } catch (e) {
+        setError(`Saved, but matching the answer key again failed: ${(e as Error).message}`);
+      }
+    }
     return true;
   }
 
@@ -151,7 +170,19 @@ export default function QuestionPage() {
 
         <section className="space-y-3">
           <h2 className="font-bold">Answer</h2>
-          <AnswerEditor key={q.type} questionId={q.id} type={q.type} answer={answer} onSaved={setAnswer} />
+          {answer?.source_page_id && <p className="text-sm text-muted">From an answer key. Saving a change here makes it your own answer.</p>}
+          <AnswerEditor key={`${q.type}-${answerVersion}`} questionId={q.id} type={q.type} answer={answer} onSaved={setAnswer} />
+          {answer?.answer_image_path && (
+            <div className="space-y-1">
+              <h3 className="text-sm font-bold text-muted">Worked solution</h3>
+              {solutionUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={solutionUrl} alt={`Worked solution for question ${q.number}`} className="card block w-full bg-white" />
+              ) : (
+                <div className="h-40 animate-pulse rounded-xl bg-sunken" />
+              )}
+            </div>
+          )}
         </section>
 
         <button

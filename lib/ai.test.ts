@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { locateQuestions, readQuestion } from "./ai";
+import { locateAnswerKey, locateQuestions, readKeyEntries, readQuestion, readWorkedSolution } from "./ai";
 
 function jsonResponse(body: unknown, init?: { status?: number; headers?: Record<string, string> }) {
   return new Response(JSON.stringify(body), { status: init?.status ?? 200, headers: init?.headers });
@@ -123,5 +123,74 @@ describe("readQuestion (Groq)", () => {
   it("returns rate_limited with null retryAfterMs when no header is sent", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({}, { status: 429 })));
     expect(await readQuestion(Buffer.from("img"), hint)).toEqual({ ok: false, kind: "rate_limited", retryAfterMs: null });
+  });
+});
+
+describe("locateAnswerKey (Gemini)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("converts every box and keeps numbers as text", async () => {
+    const layout = {
+      columns: 2,
+      headings: [{ text: "ANSWERS", box_2d: [418, 396, 466, 512] }],
+      key_regions: [{ box_2d: [487, 135, 715, 765], rows: 4, columns: 10, first_number: 1, last_number: "36" }],
+      solutions: [{ number: 5, column: 2, box_2d: [52, 605, 120, 976] }],
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(geminiBody(layout))));
+    const result = await locateAnswerKey(Buffer.from("img"));
+    expect(result.ok && result.data).toEqual({
+      columns: 2,
+      headings: [{ text: "ANSWERS", bbox: [0.396, 0.418, 0.512, 0.466] }],
+      regions: [{ bbox: [0.135, 0.487, 0.765, 0.715], rows: 4, columns: 10, first: "1", last: "36" }],
+      solutions: [{ number: "5", column: 2, bbox: [0.605, 0.052, 0.976, 0.12] }],
+    });
+  });
+
+  it("accepts a page with no key parts", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(geminiBody({ columns: 1 }))));
+    const result = await locateAnswerKey(Buffer.from("img"));
+    expect(result.ok && result.data).toEqual({ columns: 1, headings: [], regions: [], solutions: [] });
+  });
+});
+
+describe("readKeyEntries / readWorkedSolution (Groq)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const tableHint = { rows: 4, columns: 10, first: "1", last: "36" };
+
+  it("sends the sized cap and the table hint, and returns the entries", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(groqBody(JSON.stringify({ entries: [{ number: 1, answer: "(d)" }] }))));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await readKeyEntries(Buffer.from("img"), tableHint, 300);
+    expect(result.ok && result.data).toEqual([{ number: "1", answer: "(d)" }]);
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(sent.max_completion_tokens).toBe(300);
+    expect(sent.messages[1].content[0].text).toContain("numbered 1 to 36");
+  });
+
+  it("asks for only the missing numbers on a targeted re-read", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(groqBody(JSON.stringify({ entries: [] }))));
+    vi.stubGlobal("fetch", fetchMock);
+    await readKeyEntries(Buffer.from("img"), { ...tableHint, only: ["7", "14"] }, 120);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).messages[1].content[0].text).toContain("only these entries of the answer key in this crop: 7, 14");
+  });
+
+  it("retries a cut-off reply once with a larger cap", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(groqBody('{"entries": [', "length")))
+      .mockResolvedValueOnce(jsonResponse(groqBody(JSON.stringify({ entries: [] }))));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await readKeyEntries(Buffer.from("img"), tableHint, 200)).ok).toBe(true);
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).max_completion_tokens).toBe(900);
+  });
+
+  it("returns a worked solution's text, with a null stated answer when it gives none", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(groqBody(JSON.stringify({ text: "int x;" }))));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await readWorkedSolution(Buffer.from("img"), "3", 250);
+    expect(result.ok && result.data).toEqual({ text: "int x;", statedAnswer: null });
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(sent.max_completion_tokens).toBe(250);
+    expect(sent.messages[1].content[0].text).toBe("Transcribe solution 3.");
   });
 });

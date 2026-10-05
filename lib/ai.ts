@@ -4,10 +4,26 @@
  *
  * - locateQuestions(): Gemini finds where each question is on the page.
  * - readQuestion(): Groq's Qwen transcribes one cropped question.
+ * - locateAnswerKey(), readKeyEntries(), readWorkedSolution(): the same
+ *   split for answer-key pages (see lib/prompts/answer-key.ts).
  * See lib/prompts/segment.ts for why the work is split this way.
  */
 import type { z } from "zod";
+import {
+  KeyEntriesResponseSchema,
+  KeyLayoutResponseSchema,
+  WorkedReadResponseSchema,
+  type KeyEntryRead,
+  type KeyLayout,
+} from "./answer-key/schema";
 import { log } from "./log";
+import {
+  KEY_LAYOUT_SYSTEM_PROMPT,
+  KEY_READ_SYSTEM_PROMPT,
+  WORKED_READ_SYSTEM_PROMPT,
+  keyReadUserPrompt,
+  workedReadUserPrompt,
+} from "./prompts/answer-key";
 import { LAYOUT_SYSTEM_PROMPT, READ_SYSTEM_PROMPT, readUserPrompt } from "./prompts/segment";
 import {
   LayoutResponseSchema,
@@ -29,6 +45,9 @@ const OTHER_ERROR_DELAYS_MS = [500, 1500];
 // Groq checks a request's max output against the per-minute output budget
 // (1,000/min on the free tier), so keep it to what one question needs.
 const READ_MAX_TOKENS = 700;
+// Answer-key reads size their cap per call; a reply cut off at it is retried once with these.
+const KEY_RETRY_MAX_TOKENS = 900;
+const WORKED_RETRY_MAX_TOKENS = 700;
 
 type Usage = { promptTokens: number; completionTokens: number };
 
@@ -47,6 +66,8 @@ type CallOutcome<T> =
   | { kind: "invalid"; issue: string }
   | { kind: "rate_limited"; retryAfterMs: number | null }
   | { kind: "http_error"; detail: string };
+
+type Box = [number, number, number, number];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -70,7 +91,7 @@ function validate<T>(content: unknown, schema: z.ZodType<T>, usage: Usage): Call
 
 /** Quick retries for network/5xx errors, then one retry (told what was wrong) for an invalid response. */
 async function withRetries<T>(
-  stage: "layout" | "read",
+  stage: "layout" | "read" | "key_layout" | "key_read" | "worked_read",
   model: string,
   callOnce: (retryIssue?: string) => Promise<CallOutcome<T>>,
 ): Promise<AiResult<T>> {
@@ -115,18 +136,31 @@ function geminiRetryDelayMs(body: unknown): number | null {
   return null;
 }
 
-async function layoutOnce(model: string, image: Buffer, retryIssue?: string): Promise<CallOutcome<Layout>> {
-  const text = retryIssue
-    ? `Locate the questions on this page. Your previous response was invalid: ${retryIssue}. Return valid JSON matching the schema exactly.`
-    : "Locate the questions on this page.";
+const invalidRetryText = (ask: string, retryIssue?: string) =>
+  retryIssue ? `${ask} Your previous response was invalid: ${retryIssue}. Return valid JSON matching the schema exactly.` : ask;
+
+/** One Gemini generateContent call on one image, JSON output validated against `schema`. */
+async function geminiOnce<T>(
+  model: string,
+  system: string,
+  ask: string,
+  image: Buffer,
+  schema: z.ZodType<T>,
+  retryIssue?: string,
+): Promise<CallOutcome<T>> {
   let res: Response;
   try {
     res = await fetch(`${GEMINI_ENDPOINT}/${model}:generateContent`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY ?? "" },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: LAYOUT_SYSTEM_PROMPT }] },
-        contents: [{ role: "user", parts: [{ inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }, { text }] }],
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [
+          {
+            role: "user",
+            parts: [{ inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }, { text: invalidRetryText(ask, retryIssue) }],
+          },
+        ],
         generationConfig: { responseMimeType: "application/json", temperature: 0 },
       }),
     });
@@ -145,40 +179,22 @@ async function layoutOnce(model: string, image: Buffer, retryIssue?: string): Pr
   const candidate = body?.candidates?.[0];
   const parts: { text?: string }[] | undefined = candidate?.content?.parts;
   if (!parts) return { kind: "invalid", issue: `no content (finishReason ${candidate?.finishReason ?? "none"})` };
-  const usage = {
+  return validate(parts.map((p) => p.text ?? "").join(""), schema, {
     promptTokens: body?.usageMetadata?.promptTokenCount ?? 0,
     completionTokens: body?.usageMetadata?.candidatesTokenCount ?? 0,
-  };
-  const outcome = validate(parts.map((p) => p.text ?? "").join(""), LayoutResponseSchema, usage);
-  if (outcome.kind !== "ok") return outcome;
-
-  return {
-    kind: "ok",
-    usage,
-    data: {
-      columns: outcome.data.columns,
-      questions: outcome.data.questions.map(({ box_2d: [ymin, xmin, ymax, xmax], ...q }) => ({
-        ...q,
-        bbox: [xmin / 1000, ymin / 1000, xmax / 1000, ymax / 1000],
-      })),
-    },
-  };
+  });
 }
 
-/** Where each question is on the page (no text). `image` is the downscaled page JPEG. */
-export async function locateQuestions(image: Buffer): Promise<AiResult<Layout>> {
-  const model = layoutModelName();
-  return withRetries("layout", model, (retryIssue) => layoutOnce(model, image, retryIssue));
-}
-
-async function readOnce(
+/** One Groq chat-completions call on one image, JSON output validated against `schema`. */
+async function groqOnce<T>(
   model: string,
-  crop: Buffer,
-  hint: { number: string | null; optionCount: number },
+  system: string,
+  ask: string,
+  image: Buffer,
+  schema: z.ZodType<T>,
+  maxTokens: number,
   retryIssue?: string,
-): Promise<CallOutcome<ReadResponse>> {
-  const ask = readUserPrompt(hint.number, hint.optionCount);
-  const text = retryIssue ? `${ask} Your previous response was invalid: ${retryIssue}. Return valid JSON matching the schema exactly.` : ask;
+): Promise<CallOutcome<T>> {
   let res: Response;
   try {
     res = await fetch(GROQ_ENDPOINT, {
@@ -187,18 +203,18 @@ async function readOnce(
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: READ_SYSTEM_PROMPT },
+          { role: "system", content: system },
           {
             role: "user",
             content: [
-              { type: "text", text },
-              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${crop.toString("base64")}` } },
+              { type: "text", text: invalidRetryText(ask, retryIssue) },
+              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${image.toString("base64")}` } },
             ],
           },
         ],
         response_format: { type: "json_object" },
         temperature: 0,
-        max_completion_tokens: READ_MAX_TOKENS,
+        max_completion_tokens: maxTokens,
       }),
     });
   } catch (e) {
@@ -214,10 +230,29 @@ async function readOnce(
   const body = await res.json().catch(() => null);
   const choice = body?.choices?.[0];
   if (choice?.finish_reason === "length") return { kind: "invalid", issue: "response was cut off; keep it shorter" };
-  return validate(choice?.message?.content, ReadResponseSchema, {
+  return validate(choice?.message?.content, schema, {
     promptTokens: body?.usage?.prompt_tokens ?? 0,
     completionTokens: body?.usage?.completion_tokens ?? 0,
   });
+}
+
+/** Gemini's [ymin, xmin, ymax, xmax] 0-1000 → our [x0, y0, x1, y1] 0-1. */
+const toBbox = ([ymin, xmin, ymax, xmax]: Box): Box => [xmin / 1000, ymin / 1000, xmax / 1000, ymax / 1000];
+
+/** Where each question is on the page (no text). `image` is the downscaled page JPEG. */
+export async function locateQuestions(image: Buffer): Promise<AiResult<Layout>> {
+  const model = layoutModelName();
+  const result = await withRetries("layout", model, (retryIssue) =>
+    geminiOnce(model, LAYOUT_SYSTEM_PROMPT, "Locate the questions on this page.", image, LayoutResponseSchema, retryIssue),
+  );
+  if (!result.ok) return result;
+  return {
+    ...result,
+    data: {
+      columns: result.data.columns,
+      questions: result.data.questions.map(({ box_2d, ...q }) => ({ ...q, bbox: toBbox(box_2d) })),
+    },
+  };
 }
 
 /** The text and options of one question. `crop` is a JPEG of just that question's region. */
@@ -226,5 +261,81 @@ export async function readQuestion(
   hint: { number: string | null; optionCount: number },
 ): Promise<AiResult<ReadResponse>> {
   const model = readModelName();
-  return withRetries("read", model, (retryIssue) => readOnce(model, crop, hint, retryIssue));
+  const ask = readUserPrompt(hint.number, hint.optionCount);
+  return withRetries("read", model, (retryIssue) =>
+    groqOnce(model, READ_SYSTEM_PROMPT, ask, crop, ReadResponseSchema, READ_MAX_TOKENS, retryIssue),
+  );
+}
+
+/** Headings, short-answer tables and worked solutions on an answer-key page: positions only. */
+export async function locateAnswerKey(image: Buffer): Promise<AiResult<KeyLayout>> {
+  const model = layoutModelName();
+  const result = await withRetries("key_layout", model, (retryIssue) =>
+    geminiOnce(model, KEY_LAYOUT_SYSTEM_PROMPT, "Locate the answer-key parts of this page.", image, KeyLayoutResponseSchema, retryIssue),
+  );
+  if (!result.ok) return result;
+  const d = result.data;
+  return {
+    ...result,
+    data: {
+      columns: d.columns,
+      headings: d.headings.map((h) => ({ text: h.text, bbox: toBbox(h.box_2d) })),
+      regions: d.key_regions.map((r) => ({
+        bbox: toBbox(r.box_2d),
+        rows: r.rows,
+        columns: r.columns,
+        first: r.first_number,
+        last: r.last_number,
+      })),
+      solutions: d.solutions.map((s) => ({ number: s.number, column: s.column, bbox: toBbox(s.box_2d) })),
+    },
+  };
+}
+
+/**
+ * Entries of one crop of a short-answer table. `maxTokens` should be sized
+ * to the crop: Groq appears to count the cap against the per-minute output
+ * budget before answering, so an oversized cap costs waiting time. A reply
+ * cut off at the cap is retried once with a larger one.
+ */
+export async function readKeyEntries(
+  crop: Buffer,
+  hint: { rows: number; columns: number; first: string; last: string; only?: string[] },
+  maxTokens: number,
+): Promise<AiResult<KeyEntryRead[]>> {
+  const model = readModelName();
+  const ask = keyReadUserPrompt(hint);
+  const result = await withRetries("key_read", model, (retryIssue) =>
+    groqOnce(
+      model,
+      KEY_READ_SYSTEM_PROMPT,
+      ask,
+      crop,
+      KeyEntriesResponseSchema,
+      retryIssue ? Math.max(maxTokens, KEY_RETRY_MAX_TOKENS) : maxTokens,
+      retryIssue,
+    ),
+  );
+  return result.ok ? { ...result, data: result.data.entries } : result;
+}
+
+/** The text of one worked solution, and its stated final answer if it gives one. */
+export async function readWorkedSolution(
+  crop: Buffer,
+  number: string,
+  maxTokens: number,
+): Promise<AiResult<{ text: string; statedAnswer: string | null }>> {
+  const model = readModelName();
+  const result = await withRetries("worked_read", model, (retryIssue) =>
+    groqOnce(
+      model,
+      WORKED_READ_SYSTEM_PROMPT,
+      workedReadUserPrompt(number),
+      crop,
+      WorkedReadResponseSchema,
+      retryIssue ? Math.max(maxTokens, WORKED_RETRY_MAX_TOKENS) : maxTokens,
+      retryIssue,
+    ),
+  );
+  return result.ok ? { ...result, data: { text: result.data.text, statedAnswer: result.data.stated_answer ?? null } } : result;
 }

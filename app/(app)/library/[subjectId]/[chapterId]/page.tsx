@@ -1,6 +1,6 @@
 "use client";
 
-import { Camera, MoreHorizontal, Plus, Search } from "lucide-react";
+import { Camera, KeyRound, MoreHorizontal, Plus, Search } from "lucide-react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -147,9 +147,14 @@ export default function ChapterPage() {
         subtitle={subject?.name}
         back={`/library/${subjectId}`}
         right={
-          <Link href={uploadHref} className="btn-icon" aria-label="Add pages to this chapter">
-            <Camera size={22} aria-hidden />
-          </Link>
+          <div className="flex gap-1">
+            <Link href={`/library/${subjectId}/${chapterId}/answers`} className="btn-icon" aria-label="Answer key matching">
+              <KeyRound size={22} aria-hidden />
+            </Link>
+            <Link href={uploadHref} className="btn-icon" aria-label="Add pages to this chapter">
+              <Camera size={22} aria-hidden />
+            </Link>
+          </div>
         }
       />
       <div

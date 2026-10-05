@@ -1,7 +1,10 @@
 /**
  * POST /api/pages/:pageId/segment
  *
- * Runs one page through the AI pipeline and stores the result on the page:
+ * Runs one page through the AI pipeline and stores the result on the page.
+ * Answer-key pages take their own branch (lib/answer-key/pipeline.ts) with
+ * the same claim, progress/resume, time budget and rate-limit handling.
+ * Question pages:
  *   1. layout — Gemini locates every question (lib/ai.ts locateQuestions);
  *      the boxes are cleaned up, snapped and tiled (cleanup.ts, snap.ts).
  *   2. reading — Groq's Qwen transcribes each question from its own crop
@@ -30,6 +33,8 @@ import { NextResponse } from "next/server";
 import sharp from "sharp";
 import { z } from "zod";
 import { locateQuestions, readModelName, readQuestion } from "@/lib/ai";
+import { runAnswerKeyPage } from "@/lib/answer-key/pipeline";
+import type { KeyAiProgress } from "@/lib/answer-key/schema";
 import { log } from "@/lib/log";
 import { cleanupQuestions } from "@/lib/segment/cleanup";
 import { cropForReading } from "@/lib/segment/crop";
@@ -49,7 +54,7 @@ const LAYOUT_MAX_EDGE = 2000;
 // the page goes back to 'queued' and the next request picks up where this stopped.
 const READ_BUDGET_MS = 40_000;
 
-type ErrorCode = "page_not_found" | "unauthorized" | "wrong_kind" | "not_claimable" | "segment_crashed";
+type ErrorCode = "page_not_found" | "unauthorized" | "not_claimable" | "segment_crashed";
 
 function fail(status: number, code: ErrorCode, reqId: string, extra: Record<string, unknown> = {}) {
   return NextResponse.json({ error: code, requestId: reqId, ...extra }, { status });
@@ -77,14 +82,13 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
     .update({ status: "processing", retry_after: null })
     .eq("id", pageId)
     .eq("user_id", userId)
-    .eq("kind", "questions")
     .or(
       `status.eq.queued,` +
         `and(status.eq.rate_limited,retry_after.is.null),` +
         `and(status.eq.rate_limited,retry_after.lte.${nowIso}),` +
         `and(status.eq.processing,updated_at.lt.${staleIso})`,
     )
-    .select("id, original_path, processed_path, retry_count, ai_progress")
+    .select("id, kind, original_path, processed_path, retry_count, ai_progress")
     .maybeSingle();
 
   if (claim.error) {
@@ -93,9 +97,8 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
   }
 
   if (!claim.data) {
-    const current = await svc.from("pages").select("status, kind").eq("id", pageId).eq("user_id", userId).maybeSingle();
+    const current = await svc.from("pages").select("status").eq("id", pageId).eq("user_id", userId).maybeSingle();
     if (!current.data) return fail(404, "page_not_found", reqId);
-    if (current.data.kind !== "questions") return fail(400, "wrong_kind", reqId);
     return fail(409, "not_claimable", reqId, { status: current.data.status });
   }
 
@@ -106,7 +109,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
   const finish = (patch: Record<string, unknown>) =>
     svc.from("pages").update(patch).eq("id", pageId).eq("user_id", userId).eq("status", "processing");
 
-  const rateLimited = async (retryAfterMs: number | null, progress: AiProgress | null, stage: string) => {
+  const rateLimited = async (retryAfterMs: number | null, progress: AiProgress | KeyAiProgress | null, stage: string) => {
     const delayMs = retryAfterMs ?? Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** page.retry_count);
     await finish({
       status: "rate_limited",
@@ -124,6 +127,33 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
     if (original.error || !original.data) throw new Error(`download_failed: ${original.error?.message}`);
     const raw = Buffer.from(await original.data.arrayBuffer());
     const full = await sharp(raw).rotate().toBuffer();
+
+    if (page.kind === "answer_key") {
+      const step = await runAnswerKeyPage(full, page.ai_progress as KeyAiProgress | null, started + READ_BUDGET_MS);
+      if (step.kind === "rate_limited") return rateLimited(step.retryAfterMs, step.progress, "key");
+      if (step.kind === "failed") {
+        await finish({ status: "failed", error: step.error, retry_after: null, ai_progress: null });
+        log("segment_done", { reqId, pageId, kind: "answer_key", status: "failed", error: step.error, ms: Date.now() - started });
+        return NextResponse.json({ status: "failed", error: step.error });
+      }
+      if (step.kind === "budget") {
+        await finish({ status: "queued", ai_progress: step.progress });
+        log("segment_done", { reqId, pageId, kind: "answer_key", status: "queued", stage: "read_budget", ms: Date.now() - started });
+        return NextResponse.json({ status: "queued" });
+      }
+      await finish({
+        status: "needs_review",
+        ai_result: step.result,
+        ai_progress: null,
+        ai_model: step.result.model,
+        ai_processed_at: new Date().toISOString(),
+        error: null,
+        retry_after: null,
+        retry_count: 0,
+      });
+      log("segment_done", { reqId, pageId, kind: "answer_key", status: "needs_review", entries: step.result.entries.length, ms: Date.now() - started });
+      return NextResponse.json({ status: "needs_review" });
+    }
 
     let progress = page.ai_progress as AiProgress | null;
 

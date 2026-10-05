@@ -35,6 +35,9 @@ export function AnswerEditor({
     setError(null);
     const row: Record<string, unknown> = {
       question_id: questionId,
+      // Saved by hand: the answer is now the user's own, so answer-key matching
+      // never overwrites it and deleting the key page keeps it.
+      source_page_id: null,
       answer_text: text.trim() || null,
       correct_options: null,
       numeric_min: null,

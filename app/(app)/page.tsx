@@ -30,7 +30,6 @@ export default function HomePage() {
       db
         .from("pages")
         .select("*")
-        .eq("kind", "questions")
         .in("status", ["uploaded", "needs_review"])
         .order("created_at")
         .limit(20),
@@ -72,13 +71,19 @@ export default function HomePage() {
           <>
             {pending.length > 0 && (
               <section className="space-y-2">
-                <h2 className="font-bold">Pages waiting for question boxes</h2>
+                <h2 className="font-bold">Pages waiting for review</h2>
                 <ul className="card divide-y divide-line">
                   {pending.map((p) => (
                     <li key={p.id}>
-                      <Link href={`/upload/${p.id}`} className="flex items-center justify-between gap-3 px-4 py-3">
-                        <span className="min-w-0 truncate">{pathLabel(h, p.chapter_id, p.section_id)}</span>
-                        <span className="shrink-0 text-sm font-bold text-accent">Mark boxes</span>
+                      <Link
+                        href={p.kind === "answer_key" ? `/upload/key/${p.id}` : `/upload/${p.id}`}
+                        className="flex items-center justify-between gap-3 px-4 py-3"
+                      >
+                        <span className="min-w-0 truncate">
+                          {pathLabel(h, p.chapter_id, p.section_id)}
+                          {p.kind === "answer_key" && <span className="text-muted"> · answer key</span>}
+                        </span>
+                        <span className="shrink-0 text-sm font-bold text-accent">{p.kind === "answer_key" ? "Review answers" : "Mark boxes"}</span>
                       </Link>
                     </li>
                   ))}

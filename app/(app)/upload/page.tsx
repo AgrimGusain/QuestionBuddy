@@ -23,10 +23,15 @@ const POLL_MS = 4000;
 interface Item {
   key: string;
   name: string;
+  kind: PageKind;
   state: "waiting" | "preparing" | "uploading" | "done" | "error";
   pageId?: string;
   error?: string;
 }
+
+/** Each kind of page has its own review screen. */
+const reviewHref = (kind: PageKind, pageId: string) => (kind === "answer_key" ? `/upload/key/${pageId}` : `/upload/${pageId}`);
+const reviewLabel = (kind: PageKind) => (kind === "answer_key" ? "Review answers" : "Mark boxes");
 
 function readLastPick(): Picked {
   try {
@@ -75,7 +80,7 @@ function PendingRow({ page, label, onRetry }: { page: PageRow; label: string; on
         <button type="button" className="btn-icon shrink-0" aria-label="Retry" onClick={() => onRetry(page.id)}>
           <RotateCw size={18} aria-hidden />
         </button>
-        <Link href={`/upload/${page.id}`} className="btn-icon shrink-0" aria-label="Draw manually">
+        <Link href={reviewHref(page.kind, page.id)} className="btn-icon shrink-0" aria-label={page.kind === "answer_key" ? "Enter answers manually" : "Draw manually"}>
           <Pencil size={18} aria-hidden />
         </Link>
       </div>
@@ -83,9 +88,9 @@ function PendingRow({ page, label, onRetry }: { page: PageRow; label: string; on
   }
 
   return (
-    <Link href={`/upload/${page.id}`} className="flex items-center justify-between gap-3 px-4 py-3">
+    <Link href={reviewHref(page.kind, page.id)} className="flex items-center justify-between gap-3 px-4 py-3">
       <span className="min-w-0 truncate">{label}</span>
-      <span className="shrink-0 text-sm font-bold text-accent">Mark boxes</span>
+      <span className="shrink-0 text-sm font-bold text-accent">{reviewLabel(page.kind)}</span>
     </Link>
   );
 }
@@ -123,7 +128,6 @@ function UploadInner() {
       supabase()
         .from("pages")
         .select("*")
-        .eq("kind", "questions")
         .in("status", PENDING_STATUSES)
         .order("created_at"),
     ]);
@@ -183,7 +187,7 @@ function UploadInner() {
   async function handleFiles(files: File[]) {
     if (!files.length || !picked.chapterId) return;
     setError(null);
-    const batch: Item[] = files.map((f) => ({ key: uuid(), name: f.name || "Photo", state: "waiting" }));
+    const batch: Item[] = files.map((f) => ({ key: uuid(), name: f.name || "Photo", kind, state: "waiting" }));
     setItems((list) => [...batch, ...list]);
     setBusy(true);
     localStorage.setItem(LAST_PICK, JSON.stringify(picked));
@@ -192,7 +196,10 @@ function UploadInner() {
     let userId: string;
     try {
       userId = await currentUserId();
-      if (!sectionId) {
+      // Question pages need a section ("General" by default). Answer-key pages
+      // may span sections: with none picked, each entry's section comes from
+      // the headings on the page, or is chosen on the review screen.
+      if (!sectionId && kind === "questions") {
         sectionId = await ensureGeneralSection(picked.chapterId);
       }
     } catch (e) {
@@ -221,21 +228,19 @@ function UploadInner() {
         // Corner-adjust before the page enters the AI queue, so segmentation never
         // runs against an unflattened image when the user chose to flatten it.
         let processedPath: string | null = null;
-        if (kind === "questions") {
-          const flattened = await adjustCorners(file);
-          if (flattened) {
-            const cleanPath = `${userId}/${pageId}.clean.jpg`;
-            const upClean = await supabase().storage.from("pages").upload(cleanPath, flattened, { contentType: "image/jpeg", upsert: false });
-            if (!upClean.error) processedPath = cleanPath;
-          }
+        const flattened = await adjustCorners(file);
+        if (flattened) {
+          const cleanPath = `${userId}/${pageId}.clean.jpg`;
+          const upClean = await supabase().storage.from("pages").upload(cleanPath, flattened, { contentType: "image/jpeg", upsert: false });
+          if (!upClean.error) processedPath = cleanPath;
         }
 
         const row = await supabase().from("pages").insert({
           id: pageId,
           chapter_id: picked.chapterId,
-          section_id: sectionId,
+          section_id: sectionId || null,
           kind,
-          status: kind === "questions" ? "queued" : "needs_review",
+          status: "queued",
           original_path: path,
           processed_path: processedPath,
         });
@@ -243,7 +248,7 @@ function UploadInner() {
           await supabase().storage.from("pages").remove(processedPath ? [path, processedPath] : [path]);
           throw new Error(row.error.message);
         }
-        if (kind === "questions") wakeQueueRunner();
+        wakeQueueRunner();
         patch(key, { state: "done", pageId });
       } catch (e) {
         const msg = (e as Error).message;
@@ -257,7 +262,7 @@ function UploadInner() {
     await loadPending();
   }
 
-  const ready = !!picked.chapterId && kind === "questions";
+  const ready = !!picked.chapterId;
 
   return (
     <>
@@ -269,7 +274,11 @@ function UploadInner() {
       )}
       <TopBar title="Add pages" />
       <main className="space-y-6 px-4 py-4">
-        <HierarchyPicker value={picked} onChange={setPicked} sectionOptional="General (default)" />
+        <HierarchyPicker
+          value={picked}
+          onChange={setPicked}
+          sectionOptional={kind === "answer_key" ? "From the page's headings" : "General (default)"}
+        />
 
         <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Page kind">
           <button type="button" role="radio" aria-checked={kind === "questions"} className="chip justify-center" onClick={() => setKind("questions")}>
@@ -281,7 +290,8 @@ function UploadInner() {
         </div>
         {kind === "answer_key" && (
           <p className="text-sm text-muted">
-            Reading answer keys arrives in Phase 3. For now, type answers on each question&apos;s page.
+            Answer keys can cover several sections. Leave the section empty to take it from headings like “Exercise 1” on the
+            page; you can check and change it before saving.
           </p>
         )}
 
@@ -342,8 +352,8 @@ function UploadInner() {
                     </span>
                   </span>
                   {i.pageId && (
-                    <Link href={`/upload/${i.pageId}`} className="shrink-0 text-sm font-bold text-accent">
-                      Mark boxes
+                    <Link href={reviewHref(i.kind, i.pageId)} className="shrink-0 text-sm font-bold text-accent">
+                      {reviewLabel(i.kind)}
                     </Link>
                   )}
                 </li>

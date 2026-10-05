@@ -1,7 +1,9 @@
 QUESTION BUDDY (Snap Question Bank) — WORK LOG AND TEST STATUS
-Last updated: 2026-10-05 (session 2)
-Status: all work below is committed and pushed to GitHub (main).
-All 3 new migrations ARE applied to the real Supabase project.
+Last updated: 2026-10-05 (session 3)
+Status: sessions 1-2 are committed and pushed (4e4fc19 on main).
+Session 3 (Phase 3, answer keys) is in the working tree, NOT committed.
+The Phase 3 migration (20261006000000) IS applied to the real Supabase
+project (end of session 3; dry run: "Remote database is up to date").
 
 ========================================================================
 1. WHAT THE APP IS
@@ -18,7 +20,13 @@ Photo -> flatten -> Gemini finds where each question is -> boxes
 snapped to whitespace and tiled -> Groq's Qwen reads each question's
 text and options from its own crop -> you review and fix -> save with
 the existing save function. Hand-drawn boxes still work on every page.
-Answer-key pages keep the Phase 1 manual flow.
+
+Phase 3 (built in session 3): answer keys. Key pages go through the same
+capture + queue; Gemini finds short-answer tables, worked solutions and
+headings (positions only); Qwen reads them; a deterministic parser turns
+the text into options / numbers / text; you review the entries; saving
+stores them and matches them to questions in SQL by chapter + section +
+number. A matching summary per chapter handles conflicts.
 
 ========================================================================
 2. SESSION 1 WORK (Phase 2 build)
@@ -307,103 +315,372 @@ fits the 1,000/min budget, can't mix questions together).
   update when switching to theory, so the icon fills in at once.
 
 ========================================================================
-4. WHAT IS TESTED
+4. SESSION 3 WORK (Phase 3: answer keys)
 ========================================================================
 
-4.1 Automated checks
+4.1 Step 0 / Step 1 (before any Phase 3 code)
+---------------------------------------------
+- Step 0: tsc, npm test (87), npm run build all passed. One run of
+  npm test reported "9 failed, no tests" with no detail; the next 6 runs
+  passed with nothing changed in between. Not reproduced; cause unknown.
+- Step 1 measurements (scratch scripts outside the repo; the user's two
+  photos, both low resolution: 1599×720 and 720×909):
+  * Short-key page (36 entries incl. "15. (19)", "31. (a; c)"):
+    Qwen whole page 36/36, 588 output tokens, 1.7s. Gemini table box +
+    Qwen on that crop 36/36, 152 + 508 tokens. The same table cut in two
+    at its midpoint: 30/36 (lost 7, 14, 17, 24, 27, 34). ~15 output
+    tokens per entry.
+  * Worked page: Gemini found all 13 solutions with numbers/columns.
+    Qwen read 10/13; the other 3 failed because Gemini's boxes for
+    one-line solutions were tiny (59×22, 133×27, 72×28 px) and Groq
+    rejected them. Only 1/13 solutions states its final answer.
+  * Groq appears to check max_completion_tokens (not the actual reply)
+    against the 1,000/min budget: every 700-capped call waited ~20s,
+    even after 40-token replies. A worked page took ~4.5 min, nearly
+    all waiting.
+  * Gemini returned the headings "ANSWERS" and "EXPLANATIONS" with
+    positions and no RECITATION refusal. Headings like "Exercise 1" /
+    "Level 2" were NOT tested (none on these pages).
+
+4.2 Database: supabase/migrations/20261006000000_phase3_answer_keys.sql
+-----------------------------------------------------------------------
+- Enums answer_entry_kind (short | worked) and answer_entry_status
+  (unmatched | matched | conflict | ignored | kept_mine).
+- pages gets unique (id, chapter_id, user_id) so entries can prove their
+  chapter is their page's.
+- Table answer_key_entries: user_id default auth.uid(), RLS owner
+  policy, composite FKs (page+chapter+user cascade; section set null on
+  delete; question set null on delete), number_normalized generated,
+  raw_text, parsed fields (correct_options, numeric_min/max,
+  answer_text, parse_flags), image_path (worked only), bbox real[4],
+  status, question_id, conflict_reason. No "matched implies question"
+  check: deleting a question nulls question_id on matched entries until
+  the app re-matches (it does, right after).
+- match_answer_key_entries(chapter): pg_advisory_xact_lock(
+  hashtextextended(chapter::text, 0)); resets everything except
+  ignored / kept_mine; deletes stale key answers (source_page_id = a key
+  page with no non-ignored entry for that question any more); flags
+  same-kind duplicates on one page; per question combines the short
+  entry (options/number/text, interpreted by question type via
+  answer_key_interpret) and the worked entry (image + text); inserts
+  answers with on conflict (question_id) do nothing, then reconciles an
+  existing answer: its own page's answer is updated/deleted to match
+  the key; a hand answer (source_page_id null) or another page's answer
+  is never overwritten — only empty fields are filled (e.g. the
+  solution image); a different option/number is a conflict
+  (differs_from_your_answer / differs_from_key_answer). Text never
+  conflicts. Other reasons: multiple_options_on_mcq, option_on_numerical,
+  number_on_mcq, option_on_theory, unreadable_answer, key_no_answer,
+  duplicate_number, key_pages_disagree (answer left as is until resolved).
+- save_answer_key_page(page, entries): row lock, refuses a saved page,
+  inserts entries, matches, marks saved — one transaction.
+- apply_answer_key_entry(entry): "Use key answer" — deletes the current
+  answer and re-matches.
+- delete_answer_key_page(page): deletes answers the page wrote that
+  weren't edited since; keeps hand-edited ones (image included); clears
+  the borrowed image from other key answers (deleting them if nothing
+  else is left); deletes the page (entries cascade); re-matches; returns
+  the solution image paths nothing uses any more.
+- save_page_questions: same body plus a matching call at the end, so a
+  key saved before its questions matches once they're saved.
+
+4.3 Server
+----------
+- lib/ai.ts: refactored around shared geminiOnce / groqOnce helpers
+  (Phase 2 requests unchanged; its 10 tests pass unmodified). New:
+  locateAnswerKey, readKeyEntries(crop, hint, maxTokens),
+  readWorkedSolution(crop, number, maxTokens). A reply cut off at the
+  cap is retried once with 900 (keys) / 700 (worked).
+- lib/prompts/answer-key.ts: the measured layout / key / worked prompts.
+- lib/answer-key/schema.ts: Zod schemas + stored types (KeyAiProgress,
+  KeyAiResult with kind "answer_key", isKeyResult()).
+- lib/answer-key/parse.ts: the deterministic parser (cases in 5.2).
+- lib/answer-key/chunks.ts: expected entry count, missing numbers, and
+  splitting a table of >45 entries into bands of ≤3 rows at the
+  whitespace between rows (text-line detection; falls back to equal
+  bands moved to the nearest gap).
+- lib/answer-key/pipeline.ts: layout (pads tables 1%, plans chunks,
+  snaps solution boxes like question boxes, widens tiny ones to at
+  least 30% × 3.5% of the page) → read each table piece (cap = 16 ×
+  expected entries + 80, max 900) → one targeted re-read of missing
+  numbers (only those numbers accepted) → read each solution (cap from
+  box height, 150–700). Same progress/resume, 40s budget and rate-limit
+  handling as question pages, via pages.ai_progress.
+- Segment route: claims both kinds (no kind filter any more), branches
+  on page.kind. Queue runner: no kind filter.
+- app/api/pages/[pageId]/save-key/route.ts: validates, requires a
+  section for every non-ignored entry, checks sections belong to the
+  chapter, crops worked solutions from the flattened copy (+2%) and
+  stitches multi-part ones into one image, uploads to
+  crops/<user>/keys/<page>/<entry>.jpg, parses short answers on the
+  server, calls save_answer_key_page, removes uploads if anything fails.
+- lib/answer-key/client.ts: rematch, applyKeyEntry, setEntryStatus
+  (kept_mine / ignored / unmatched = undo), editEntry (re-parses).
+- lib/snap.ts: binarize() exported (used by chunks.ts); no behaviour
+  change.
+
+4.4 Client
+----------
+- Upload: "Answer key pages" enabled; same corner-adjust; section
+  optional (left empty = from headings; question pages still default to
+  General); queued like question pages; pending list and Home link each
+  kind to its own review screen ("Review answers").
+- Key review screen app/(app)/upload/key/[pageId]/page.tsx (+
+  components/KeyEntryList.tsx, logic in lib/answer-key/review.ts):
+  page with dashed table regions ("Answers 1–36") and editable worked-
+  solution boxes (move/resize/split; same number + section = parts of
+  one solution); heading → section mapping; "Set the section for a
+  range"; entry list (number, section, raw text → parsed meaning, ⚠);
+  edit number / section / answer (live parse) / ignore / delete;
+  "+ Entry" and "+ Solution" for manual entry; nothing saved until Save;
+  draft kept in localStorage (sqb:keydraft:<page>). Save blocked until
+  every non-ignored entry has a number and a section. The question
+  review screen redirects answer-key pages here and vice versa.
+- Matching summary app/(app)/library/[subjectId]/[chapterId]/answers:
+  counts (matched questions, conflicts, no question, no answer);
+  conflicts with key vs current answer and actions (Use key answer /
+  Keep mine / Change question to MSQ / Edit / Ignore); answers with no
+  question (edit number/section, pick a question, ignore); questions
+  with no answer; "Kept your answer" and "Ignored" lists with Undo.
+  Reached from the key page after saving and from the key icon on the
+  chapter page.
+- Question page: shows "From an answer key…" and the worked-solution
+  image; re-runs matching after a number or type change and reloads the
+  answer. Practice: shows the solution image with the answer
+  (components/SolutionImage.tsx).
+- AnswerEditor: a hand save sets source_page_id = null (the answer
+  becomes the user's).
+- lib/delete.ts: key page → delete_answer_key_page RPC + remove the
+  images it returns; question / section → keep keys/ images (owned by
+  entries) and re-match the chapter; chapter / subject → also remove all
+  solution images of those chapters.
+
+4.5 Choices that differ from the Phase 3 prompt (approved in the plan,
+    plus the user's five changes)
+--------------------------------------------------------------------
+- Short entries carry their table's box, not a box each.
+- A short and a worked entry with the same number complement each
+  other; duplicates are counted per kind.
+- "(1)"–"(4)" keeps both readings; the question type picks; flagged.
+- Hand saves make an answer the user's (AnswerEditor change).
+- A hand answer with no image gets the solution image; only options and
+  numbers conflict, never text.
+- "Pick a question by hand" changes the entry's number + section to that
+  question's.
+- Save blocked until every non-ignored entry has a section.
+- Multi-part solutions are stitched into one image.
+- Matching also re-runs on renumber / retype / question delete.
+- PGlite added as a dev dependency so the SQL tests live in the repo.
+- kept_mine status (user change 1), stale-answer cleanup + re-match on
+  type change (2), advisory lock + on conflict do nothing (3).
+- Not in the plan: a worked solution's "stated answer" is shown on the
+  review screen but not parsed into options (it stays in the text).
+- Not in the plan: when two key pages disagree, the existing answer is
+  left as is (found by a failing test; the first version deleted it).
+- Not in the plan: two worked solutions with the same number in
+  different sections on one page save as separate entries, but the box
+  labels on the review photo colour them as one number.
+
+4.6 npm problem found while adding PGlite (IMPORTANT)
+-----------------------------------------------------
+npm 11.6 on this machine prunes every platform's optional native
+packages from package-lock.json on `npm install` (npm bug #4828),
+including this machine's @rolldown/binding-win32-x64-msvc, which
+vitest needs (and vite's lightningcss binary). After one install,
+vitest wouldn't start ("Cannot find native binding"). `npm ci` couldn't
+help because the running dev server locks a native file.
+What was done: package-lock.json and package.json restored from git,
+then ONLY the @electric-sql/pglite entry added to both by a small
+script (diff: 9 lines); the three missing packages unpacked from their
+published tarballs into node_modules. `npm ls` now shows only two
+harmless "extraneous" leftovers.
+Before running `npm install` here again: stop the dev server, and check
+`git diff --stat package-lock.json` afterwards; a few-hundred-line
+deletion means it happened again (fix: delete node_modules and run
+`npm ci`).
+
+========================================================================
+5. WHAT IS TESTED
+========================================================================
+
+5.1 Automated checks (end of session 3)
+---------------------------------------
+- npx tsc --noEmit: no errors.
+- npm run build: succeeds (new routes /upload/key/[pageId],
+  /library/[subjectId]/[chapterId]/answers, /api/pages/[pageId]/save-key).
+- npm test: 229 tests in 16 files, all pass. Gemini, Groq and Supabase
+  are mocked in route tests; the SQL tests run the real migrations.
+    supabase/tests/answer-keys.test.ts 30, parse.test.ts 58,
+    sections.test.ts 13, chunks.test.ts 11, review.test.ts (key) 10,
+    ai.test.ts 16, segment route.test.ts 10, route.key.test.ts 7,
+    save-key route.test.ts 7, snap 15, review (questions) 13,
+    number 14, grading 7, cleanup 7, schema 7, runner 4.
+
+5.2 What the Phase 3 tests cover
+--------------------------------
+- Parser: (c), c, C, (a, c), (a; c), (a) and (c), a,c, Both (a) and (b),
+  & / or, (e), Ans. prefixes, (1)–(4) both readings + flag, several
+  digit options, (5)/(19)/(0) as numbers, bare digits as numbers, 4.5,
+  -0.25, Unicode minus, ranges with to / - / – / — / ~ and in brackets,
+  negative ranges, high-to-low ranges flagged, Bonus / Dropped / None /
+  Deleted / Cancelled / Marks to all / **** as no answer, unparseable
+  text kept and flagged, empty input.
+- SQL on PGlite (as a signed-in user, RLS on): matched after questions;
+  saved before questions then matched by save_page_questions; hand
+  answer differs → conflict, same → unchanged; image added to a hand
+  answer; every type-mismatch reason; digit option by type; MCQ → MSQ
+  resolves; duplicates flagged and not matched; short + worked combine;
+  two sections on one page; no section stays unmatched; kept_mine
+  survives two re-matches and can be undone; ignored left alone;
+  apply_answer_key_entry; key pages disagree; renumbering moves/deletes
+  the stale key answer; a hand-edited key answer survives renumbering;
+  retyping MCQ → numerical re-reads "(3)" as 3; retyping to a type the
+  key can't answer deletes the key answer and reports why; retyping
+  keeps the worked image/text; matching twice changes nothing the
+  second time (entries' and answers' data compared — updated_at
+  excluded, since entries are rewritten each run); an answer already
+  exists when matching inserts → the insert does nothing and the save
+  succeeds (conflict path); a key page and a question page saved one
+  after the other; double save refused; delete_answer_key_page (keeps
+  hand-edited, returns unused images); another key page fills the gap
+  after a delete; deleting a question / section; RLS: another user
+  can't see, change, match, save or insert into someone else's data.
+- The advisory lock is verified by reasoning, NOT by a test: PGlite is a
+  single connection and can't run two transactions at once. The tests
+  above cover the sequential and conflict paths only.
+- Route (answer keys): full success; rate limit part-way then resume
+  without repeating work; a 90-entry table read in 3 bands with sized
+  caps plus a targeted re-read of missing numbers (stray numbers in the
+  re-read ignored); tiny solution box widened before cropping; an
+  unreadable solution kept and flagged; the 40s time budget re-queues
+  with progress; layout failed / rate-limited.
+- save-key route: server-side parsing, crops from the flattened copy,
+  two parts stitched into one upload, section required, foreign
+  section refused, uploads removed when the RPC fails, 409 for an
+  already-saved page (up front and from the RPC, with cleanup), ignored
+  solutions not cropped, question pages refused.
+
+5.3 Earlier sessions
 --------------------
-- npx tsc --noEmit: no errors (after all session 2 changes).
-- npm test: 87 tests in 9 files, all pass. Gemini, Groq and Supabase
-  are mocked; no keys needed.
-    route.test.ts 10, ai.test.ts 10, snap.test.ts 15, review.test.ts 13,
-    number.test.ts 14, grading.test.ts 7, cleanup.test.ts 7,
-    schema.test.ts 7, runner.test.ts 4.
-  Session 2 tests cover: runner backs off after a 500; Gemini box_2d
-  conversion, RECITATION retry, retryDelay parsing, 503 -> rate_limited
-  without quick retries; Groq token cap and option hint sent, cut-off
-  reply retried, retry-after header; route claim clears retry_after,
-  layout rate-limited/failed, full success (text, options, numerical
-  drops options, ai_progress cleared, model string), rate limit
-  part-way saves progress and no ai_result, resume skips Gemini,
-  unread and options_mismatch flags; fillColumnGaps; findNearestGap.
-- npm run build: passes (re-run at the end of session 2).
-
-4.2 Migration smoke test (session 1)
-------------------------------------
-All session 1 migrations ran on a fresh in-process Postgres (PGlite)
-with stand-ins for Supabase auth/storage; 14 checks passed (columns,
-defaults, rate_limited/retry_after constraint, text/options on insert,
-append keeps hand-typed text, append_target_missing).
-
-4.3 Real runs (session 2)
--------------------------
-- All 3 migrations applied to the real Supabase project.
-- Real dev server against the real project: pages get claimed, the
-  service-role client works, Gemini layout runs, Qwen reads, rate limits
-  save progress and the next request resumes (seen in the user's logs:
-  a 30.8s request, then a 4.2s resume that read one more question
-  before Groq rate-limited again).
-- Full pipeline run by script on the test page with real Gemini + Groq:
-  all 5 questions found; all text and options complete (Q4 (a)–(d),
-  Q3 code + 4 options, Q2/Q5 numerical with no options). Groq
-  rate-limited after every ~2 reads (~20s waits), so a 5-question page
-  takes ~1.5–2 min on the free tier.
-- User confirmed in the app: question mapping works.
+- Session 2 real runs: migrations 1–3 applied; real dev server claimed,
+  read and resumed pages; scripted full pipeline on the test page read
+  all 5 questions with complete text and options.
+- Session 1 PGlite smoke test of the Phase 2 migrations (14 checks).
 
 ========================================================================
-5. WHAT IS NOT TESTED
+6. WHAT IS NOT TESTED
 ========================================================================
-- A page finishing all the way to needs_review inside the real app after
-  the session 2 changes (the user's logs stopped mid-page; the scripted
-  run did finish).
-- The two new review warnings and their clearing, in a browser.
-- The theory tag trigger in the app after applying (user hasn't
-  reported back): reload library with the Theory filter, Theory
-  revision, Practice with Theory selected.
-- The snapping change (nearest gap) on more than the one test page.
-- Gemini accuracy on other books, single-column pages, diagrams,
-  questions continuing across columns/pages.
-- The 40s read budget path (only covered by reasoning, not a test).
-- OpenCV corner detection / Flatten, touch gestures, camera photos,
-  HEIC, rotation — as in session 1.
-- Two tabs processing the queue; RLS / user_id isolation with a second
-  account.
+Phase 3 (none of it has run against the real project or in a browser):
+- The migration's behaviour on the real Supabase project (applied
+  without errors; tested only on PGlite).
+- Any Phase 3 screen in a browser or on a phone.
+- The answer-key pipeline end to end with real Gemini + Groq inside the
+  app (only the Step 1 scripts, on two low-resolution photos).
+- Heading detection for "Exercise 1" / "Level 2" style headings.
+- Real throughput of a worked page with the sized output caps.
+- The advisory lock under two real concurrent saves (reasoning only).
+- Solution images on the question page / in practice (signed URLs for
+  crops/<user>/keys/…; the storage policy allows them by first folder =
+  user id, same as question crops).
+- Deleting a key page / section / chapter in the real app (Storage
+  removal of keys/ images).
+Carried over from earlier sessions:
+- A question page finishing to needs_review inside the app after the
+  session 2 changes; the two Phase 2 review warnings in a browser; the
+  theory-tag trigger in the app; snapping on more pages; Gemini on other
+  books / single column / diagrams / continuations; OpenCV, touch,
+  camera, HEIC, rotation; two tabs; RLS with a second real account.
+- The Phase 1 "stuck on Waiting" fix on a phone (session 1).
 
 ========================================================================
-6. KNOWN LIMITS / POSSIBLE NEXT STEPS
+7. PHONE TEST CHECKLIST FOR PHASE 3 (after applying the migration)
 ========================================================================
-- Throughput is set by Groq's free-tier 1,000 output tokens/min
-  (~1 page every 1.5–2 min). Groq's Dev tier removes it.
-- Gemini's free tier is often overloaded (503); pages just wait and
-  retry. Free-tier input may be used by Google to improve its products.
-- Queue runner idles 20s when nothing is claimable, so each rate-limit
-  wait can stretch by up to 20s past retry_after. Could wake the runner
-  at the earliest retry_after instead (small change in runner.ts).
-- No "Test Gemini connection" button in Settings yet.
-- Pages read by the old one-call pipeline keep their old boxes until
-  re-queued.
-- Qwen sometimes leaves out the marks line when it sits below the
-  options (seen on Q4 when the box excluded it).
+[x] Migration applied (end of session 3).
+[ ] Upload → "Answer key pages" → pick subject + chapter, leave the
+    section empty → photograph a short-key page (like the ANSWERS
+    table) → Skip or Flatten. Pages list: "Reading…", then "Review
+    answers" (a page can take a few minutes on the Groq free tier).
+[ ] Review: the table shows as a dashed box "Answers 1–36"; the list has
+    one row per number with "read “(c)” → c". Check a few against the
+    photo. "(3)"-style answers show "c or 3" with ⚠.
+[ ] If numbers are missing, the warning lists them; add one with
+    "+ Entry", type its number and answer.
+[ ] Sections: if the page has "Exercise 1"-style headings, check they
+    map to your sections; otherwise use "Set the section for a range".
+    Save stays blocked (numbers listed) until every entry has a section
+    or is ignored.
+[ ] Save → "See what matched": counts look right; tap an item → the
+    question opens with the key's answer.
+[ ] Worked-solution page: each solution has a numbered box; move one,
+    split one, join two by giving them the same number; ignore one.
+    Save, then open a matched question: "Worked solution" image under
+    the answer, and in practice after answering.
+[ ] Key before questions: save a key for a chapter first, then save the
+    question page: the answers appear on the questions right away.
+[ ] Hand answer: type an answer on a question that differs from the key
+    → summary shows "Conflicts" with both answers. "Keep mine" → moves
+    to "Kept your answer"; Undo brings the conflict back; "Use key
+    answer" replaces yours.
+[ ] MCQ with a two-option key ("(a; c)") → "Change question to MSQ" →
+    matched.
+[ ] Renumber a matched question on its page → its key answer follows the
+    new number (or disappears if the key has none). Change a "(3)"-
+    answered MCQ to Numerical → its answer becomes 3.
+[ ] Edit a key answer by hand on the question page ("From an answer
+    key…" note shown) → delete the key page from its review screen →
+    the edited answer stays; unedited ones from that page go.
+[ ] A page that fails to read: "Enter answers manually" (pencil icon in
+    Pages) → add entries by hand → Save works.
+[ ] Two answer-key pages saved quickly in the same chapter both save.
+[ ] Delete the chapter → no leftover solution images (check the crops
+    bucket for <user>/keys/<page>/).
 
 ========================================================================
-7. BEFORE COMMITTING
+8. KNOWN LIMITS / POSSIBLE NEXT STEPS
 ========================================================================
-- Sessions 1 and 2 were committed and pushed to main at the end of
-  session 2.
-- .env.local holds real keys (Supabase service role, Groq, Gemini) —
-  keep it out of git. Set the same vars on Vercel if deployed:
-  GEMINI_API_KEY, GEMINI_LAYOUT_MODEL (optional), GROQ_API_KEY,
-  GROQ_VISION_MODEL, SUPABASE_SERVICE_ROLE_KEY.
-- package-lock.json was regenerated in session 1 (earlier uncommitted
-  changes to it were lost then).
+Phase 3:
+- Throughput: each table piece and each worked solution is one Groq call
+  under the 1,000 output tokens/min free tier; worked pages are slow
+  (one call per solution). Sized caps should help; not measured yet.
+- Heading → section mapping is by name (case, punctuation, roman
+  numerals ignored); a heading that names no section needs mapping by
+  hand.
+- A worked solution's stated answer isn't turned into options/numbers;
+  the short-key table supplies those.
+- Entries' updated_at changes on every matching run (their data does
+  not); harmless, and why the idempotence test excludes it.
+- Box labels on the key review photo colour solutions by number only, so
+  "1" in two sections looks like one solution there (they save
+  separately).
+- Phase 2 question reads still use a fixed 700-token cap (left unchanged
+  on purpose this phase).
+Carried over:
+- Groq free tier ~1 question page every 1.5–2 min; Gemini free tier 503s;
+  runner idles 20s when nothing is claimable; no "Test Gemini
+  connection"; old pages keep old boxes until re-queued; Qwen sometimes
+  drops a marks line below the options.
+
+========================================================================
+9. BEFORE COMMITTING
+========================================================================
+- Session 3 is not committed (the user commits).
+- 20261006000000_phase3_answer_keys.sql is already applied to the real
+  project.
+- package.json / package-lock.json: only @electric-sql/pglite was added
+  (see 4.6 — check the lockfile diff is small before committing).
+- .env.local holds real keys — keep it out of git. No new env vars in
+  Phase 3. On Vercel: GEMINI_API_KEY, GEMINI_LAYOUT_MODEL (optional),
+  GROQ_API_KEY, GROQ_VISION_MODEL, SUPABASE_SERVICE_ROLE_KEY.
 - public/opencv/opencv.js adds 13 MB to the repo.
+- Two identical copies of the Phase 1 migrations sit in the repo root
+  (tracked since "Initial Push"); harmless, can be deleted.
 
 ========================================================================
-8. HOW TO RUN CHECKS
+10. HOW TO RUN CHECKS
 ========================================================================
-  npm install
+  npm install          (read 4.6 first)
   npx tsc --noEmit     (or npm run typecheck)
-  npm test
+  npm test             (includes the SQL tests on PGlite)
   npm run build
   npm run dev          (http://localhost:3000)
   npx supabase db push --dry-run   (shows migrations not yet applied)

@@ -10,7 +10,7 @@ const GUTTER_SNAP_TOLERANCE = 0.02; // fraction of page width
 const ROW_WINDOW = 0.03; // ±3% of page height, per spec
 const PADDING = 0.01; // ~1%, display padding — separate from the save route's own crop padding
 
-function binarize(grey: Buffer): Uint8Array {
+export function binarize(grey: Buffer): Uint8Array {
   let sum = 0;
   for (let i = 0; i < grey.length; i++) sum += grey[i];
   const threshold = (sum / grey.length) * 0.85; // ink is noticeably darker than the page average
