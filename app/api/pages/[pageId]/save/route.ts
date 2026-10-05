@@ -2,7 +2,8 @@
  * POST /api/pages/:pageId/save
  *
  * Turns the reviewed boxes on a question page into question rows:
- * crops each box from the original photo with sharp (+2% padding),
+ * crops each box from the page photo (the flattened copy when there is
+ * one, since that's what the boxes were drawn on) with sharp (+2% padding),
  * uploads the crops, then calls save_page_questions() which inserts the
  * questions and marks the page saved in one transaction.
  *
@@ -14,6 +15,7 @@
 import { NextResponse } from "next/server";
 import sharp from "sharp";
 import { z } from "zod";
+import { log } from "@/lib/log";
 import { normalizeQuestionNumber } from "@/lib/number";
 import { serverSupabase } from "@/lib/supabase/server";
 
@@ -40,6 +42,8 @@ const Body = z.object({
         type: z.enum(["mcq", "msq", "numerical", "theory"]),
         append: z.boolean().default(false),
         boxes: z.array(Box).min(1).max(8), // parts in reading order
+        text: z.string().max(4000).optional(),
+        options: z.array(z.string().max(500)).max(8).nullable().optional(),
       }),
     )
     .min(1)
@@ -53,10 +57,6 @@ type ErrorCode =
 
 function fail(status: number, code: ErrorCode, reqId: string, extra: Record<string, unknown> = {}) {
   return NextResponse.json({ error: code, requestId: reqId, ...extra }, { status });
-}
-
-function log(event: string, fields: Record<string, unknown>) {
-  console.log(JSON.stringify({ event, ...fields }));
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -93,7 +93,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
 
   const page = await db
     .from("pages")
-    .select("id, kind, status, section_id, original_path")
+    .select("id, kind, status, section_id, original_path, processed_path")
     .eq("id", pageId)
     .maybeSingle();
   if (page.error) {
@@ -126,8 +126,9 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
   const missing = questions.filter((q, i) => q.append && !existingId.has(normalized[i])).map((q) => q.number);
   if (missing.length) return fail(409, "append_target_missing", reqId, { numbers: missing });
 
-  // Load the original photo once.
-  const original = await db.storage.from("pages").download(page.data.original_path as string);
+  // Crop from the image the boxes were drawn on: the flattened copy when there is one.
+  const sourcePath = (page.data.processed_path as string | null) ?? (page.data.original_path as string);
+  const original = await db.storage.from("pages").download(sourcePath);
   if (original.error || !original.data) {
     log("page_save_failed", { reqId, pageId, stage: "download", error: original.error?.message });
     return fail(502, "original_unreadable", reqId);
@@ -197,6 +198,9 @@ export async function POST(request: Request, ctx: { params: Promise<{ pageId: st
       type: q.type,
       append: q.append,
       image_paths: pathsByQuestion.get(q.id),
+      // Read by the RPC on insert only; an appended (existing) question's text is never touched.
+      ocr_text: q.text ?? "",
+      options: q.type === "mcq" || q.type === "msq" ? (q.options ?? null) : null,
     })),
   });
 

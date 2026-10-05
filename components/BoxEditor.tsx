@@ -13,12 +13,28 @@ export interface DraftBox {
   number: string;
   type: QuestionType;
   append: boolean; // continues a question saved from an earlier page
+  text: string; // extracted or hand-typed question text
+  options: string[] | null; // extracted or hand-typed options (mcq/msq only)
+  bboxRaw?: [number, number, number, number]; // the model's un-snapped box, for the debug toggle
+  flags?: {
+    duplicateNumber?: boolean;
+    sequenceGap?: boolean;
+    continuesFromPrevious?: boolean;
+    unread?: boolean; // the model couldn't read this question's text
+    optionsMismatch?: boolean; // fewer/more options read than the layout counted
+  };
+}
+
+/** Whether a box carries a model warning the reviewer should look at. */
+export function isFlagged(b: DraftBox): boolean {
+  const f = b.flags;
+  return !!f && !!(f.duplicateNumber || f.sequenceGap || f.continuesFromPrevious || f.unread || f.optionsMismatch);
 }
 
 type Handle = "move" | "nw" | "ne" | "sw" | "se" | "n" | "s";
 
-const MIN_W = 0.04;
-const MIN_H = 0.015;
+export const MIN_W = 0.04;
+export const MIN_H = 0.015;
 const COLORS = ["#2747c7", "#c2362b", "#18794e", "#a35f00", "#7b3fc4", "#0e7c86"];
 
 const HANDLE_POS: Record<Exclude<Handle, "move">, { left: string; top: string }> = {
@@ -60,15 +76,24 @@ export function BoxEditor({
   selectedId,
   onSelect,
   onChange,
+  splitBoxId,
+  splitT,
+  onSplitDrag,
+  showRaw,
 }: {
   imageUrl: string;
   boxes: DraftBox[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   onChange: (boxes: DraftBox[]) => void;
+  splitBoxId?: string | null;
+  splitT?: number;
+  onSplitDrag?: (t: number) => void;
+  showRaw?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const drag = useRef<{ id: string; handle: Handle; x: number; y: number; orig: DraftBox } | null>(null);
+  const splitDrag = useRef(false);
 
   const point = (e: React.PointerEvent) => {
     const r = ref.current!.getBoundingClientRect();
@@ -83,7 +108,22 @@ export function BoxEditor({
     drag.current = { id: box.id, handle, x: p.x, y: p.y, orig: box };
   };
 
+  const startSplit = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    splitDrag.current = true;
+  };
+
   const move = (e: React.PointerEvent) => {
+    if (splitDrag.current && onSplitDrag) {
+      const box = boxes.find((b) => b.id === splitBoxId);
+      if (box) {
+        const p = point(e);
+        onSplitDrag(clamp((p.y - box.y0) / (box.y1 - box.y0), 0.1, 0.9));
+      }
+      return;
+    }
     const d = drag.current;
     if (!d) return;
     const p = point(e);
@@ -109,6 +149,7 @@ export function BoxEditor({
 
   const end = () => {
     drag.current = null;
+    splitDrag.current = false;
   };
 
   return (
@@ -124,10 +165,28 @@ export function BoxEditor({
     >
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img src={imageUrl} alt="Page photo" className="block w-full" draggable={false} />
+      {showRaw &&
+        boxes.map(
+          (b) =>
+            b.bboxRaw && (
+              <div
+                key={`raw-${b.id}`}
+                aria-hidden
+                className="pointer-events-none absolute border border-dashed border-white/70"
+                style={{
+                  left: `${b.bboxRaw[0] * 100}%`,
+                  top: `${b.bboxRaw[1] * 100}%`,
+                  width: `${(b.bboxRaw[2] - b.bboxRaw[0]) * 100}%`,
+                  height: `${(b.bboxRaw[3] - b.bboxRaw[1]) * 100}%`,
+                }}
+              />
+            ),
+        )}
       {boxes.map((b) => {
         const selected = b.id === selectedId;
         const color = groupColor(boxes, b);
         const [part, parts] = partOf(boxes, b);
+        const flagged = isFlagged(b);
         return (
           <div
             key={b.id}
@@ -147,7 +206,7 @@ export function BoxEditor({
               top: `${b.y0 * 100}%`,
               width: `${(b.x1 - b.x0) * 100}%`,
               height: `${(b.y1 - b.y0) * 100}%`,
-              border: `${selected ? 3 : 2}px solid ${color}`,
+              border: `${selected ? 3 : 2}px ${flagged ? "dashed" : "solid"} ${flagged ? "#c2362b" : color}`,
               background: selected ? `${color}22` : "transparent",
               touchAction: selected ? "none" : "auto",
               zIndex: selected ? 10 : 1,
@@ -157,6 +216,7 @@ export function BoxEditor({
               className="absolute left-0 top-0 rounded-br-md px-1.5 text-sm font-bold text-white"
               style={{ background: color }}
             >
+              {flagged ? "⚠ " : ""}
               {b.number || "?"}
               {parts > 1 ? ` (${part}/${parts})` : ""}
               {b.append ? " +" : ""}
@@ -171,6 +231,16 @@ export function BoxEditor({
                   style={{ ...HANDLE_POS[h], borderColor: color, touchAction: "none" }}
                 />
               ))}
+            {splitBoxId === b.id && (
+              <span
+                aria-hidden
+                onPointerDown={startSplit}
+                className="absolute inset-x-0 h-6 -translate-y-1/2 cursor-row-resize"
+                style={{ top: `${(splitT ?? 0.5) * 100}%`, touchAction: "none" }}
+              >
+                <span className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 bg-[#c2362b]" />
+              </span>
+            )}
           </div>
         );
       })}

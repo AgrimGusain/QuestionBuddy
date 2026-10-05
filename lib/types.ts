@@ -1,3 +1,5 @@
+import type { AiResult } from "./segment/schema";
+
 export type QuestionType = "mcq" | "msq" | "numerical" | "theory";
 export type Verdict = "correct" | "partial" | "wrong";
 export type VerdictSource = "auto" | "ai" | "self";
@@ -18,9 +20,18 @@ export interface PageRow {
   kind: PageKind;
   status: PageStatus;
   original_path: string;
+  processed_path: string | null;
+  retry_after: string | null;
+  retry_count: number;
+  ai_result: AiResult | null;
+  ai_model: string | null;
+  ai_processed_at: string | null;
   error: string | null;
   created_at: string;
+  updated_at: string;
 }
+
+export type { AiResult, AiQuestion } from "./segment/schema";
 
 export interface Question {
   id: string;

@@ -1,0 +1,409 @@
+QUESTION BUDDY (Snap Question Bank) — WORK LOG AND TEST STATUS
+Last updated: 2026-10-05 (session 2)
+Status: all work below is committed and pushed to GitHub (main).
+All 3 new migrations ARE applied to the real Supabase project.
+
+========================================================================
+1. WHAT THE APP IS
+========================================================================
+Next.js 16 / React 19 / Supabase app. You photograph textbook pages, box
+each question, and build a question bank to practise from.
+
+Phase 1 (done before session 1, tested on a phone): sign-in,
+subjects/chapters/sections, photo upload with hand-drawn question boxes,
+library, answers, practice, theory revision.
+
+Phase 2 (built in session 1, reworked in session 2): auto-snipping.
+Photo -> flatten -> Gemini finds where each question is -> boxes
+snapped to whitespace and tiled -> Groq's Qwen reads each question's
+text and options from its own crop -> you review and fix -> save with
+the existing save function. Hand-drawn boxes still work on every page.
+Answer-key pages keep the Phase 1 manual flow.
+
+========================================================================
+2. SESSION 1 WORK (Phase 2 build)
+========================================================================
+Items marked [SUPERSEDED] were replaced in session 2 (section 3).
+
+2.1 Phase 1 bug fix (before Phase 2)
+-------------------------------------
+Bug: selected photos got stuck on "Waiting". The file input was cleared
+right after handleFiles() was called, which emptied the live FileList
+before the upload loop read it.
+Fix in app/(app)/upload/page.tsx: handleFiles now takes a File[] copied
+from the input before it is reset; removed a setPicked() call that made
+HierarchyPicker reset the section.
+Verified: tsc --noEmit passed. Not re-tested on a phone.
+
+2.2 Phase 2 — database
+----------------------
+Migration: supabase/migrations/20261005000000_phase2_ai_queue.sql
+(applied to the real project in session 2)
+- pages: new columns ai_result (jsonb), ai_model (text),
+  ai_processed_at (timestamptz), retry_count (smallint, default 0).
+  processed_path, retry_after and all queue statuses already existed
+  from Phase 1.
+- save_page_questions() replaced: on INSERT it now also stores ocr_text
+  and options (options forced to null unless type is mcq/msq). On
+  APPEND it still only adds crop paths, so text typed by hand on an
+  existing question is never overwritten.
+- Has a manual rollback block at the end.
+
+2.3 Phase 2 — server
+--------------------
+- [SUPERSEDED] lib/ai.ts segmentPage(image): one Groq call per page
+  returning boxes + text. Replaced by the two-stage pipeline (3.4).
+- lib/prompts/segment.ts: prompts, editable on their own (rewritten in
+  session 2).
+- lib/segment/schema.ts: Zod schemas + stored types (rewritten in
+  session 2).
+- lib/segment/cleanup.ts: clamps/fixes boxes, drops boxes under 1% of
+  the page, sorts by column then top edge, flags duplicate numbers and
+  sequence gaps (uses lib/number.ts).
+- lib/snap.ts: sharp-based snapping — column gutter detection, top and
+  bottom edges moved into whitespace near the model's edge (±3% of
+  page height), overlap between neighbours split at a gap, ~1% padding.
+  Raw and snapped boxes are both kept. (Edge rule changed and tiling
+  added in session 2, see 3.5.)
+- lib/supabase/service.ts: service-role client.
+- app/api/pages/[pageId]/segment/route.ts: processes one page.
+  Checks the caller with the normal session first, then uses the
+  service-role client with every query filtered by that user_id.
+  Claims the page with one conditional UPDATE (queued, or rate_limited
+  past retry_after, or stuck in processing > 3 min). Backoff when the
+  provider gives no delay: 10s doubling per attempt, max 5 min
+  (retry_count). Final updates only apply while the page is still
+  'processing', so a late AI result can't overwrite a page you saved by
+  hand. (Reworked for the two stages in session 2.)
+- app/api/pages/[pageId]/save/route.ts: accepts text and options per
+  question; crops (+2% padding) from the flattened copy when there is
+  one (that is the image the boxes were drawn on); uses lib/log.ts.
+- app/api/groq/test/route.ts: signed-in only; lists Groq models to
+  check the key (spends no tokens). There is no Gemini equivalent yet.
+- lib/log.ts: shared structured logger (one JSON line per event).
+
+2.4 Phase 2 — client
+--------------------
+- Upload screen (app/(app)/upload/page.tsx):
+  * Photos resized to long edge 2400px, JPEG 0.85 (lib/image.ts);
+    original and saved size logged in dev.
+  * Order per photo: upload original (never modified) -> corner-adjust
+    screen -> upload flattened copy as <page>.clean.jpg if chosen ->
+    only then create the page row as 'queued'. So the AI never reads a
+    page before its flattened copy exists.
+  * Live "Pages" list (polls every 4s): Reading…, "Retrying in Xs"
+    countdown, failed with Retry and Draw manually, Mark boxes.
+- components/CornerAdjust.tsx + lib/opencv.ts: OpenCV.js self-hosted at
+  public/opencv/opencv.js (13 MB, from @techstark/opencv-js 5.0.0),
+  loaded only on this screen. Auto-detects 4 corners (falls back to the
+  full image), draggable handles with a magnifier, Flatten (perspective
+  warp + contrast on brightness + mild sharpen) or Skip.
+- Queue runner: lib/queue/runner.ts, mounted once via
+  components/QueueRunner.tsx in app/(app)/layout.tsx. One page at a
+  time, oldest first; resumes when the app is reopened; deduplicated
+  against double mounting. (Failure backoff added in session 2.)
+- Review screen (app/(app)/upload/[pageId]/page.tsx) and
+  components/BoxEditor.tsx:
+  * AI boxes numbered and coloured; list under the page of each crop
+    with its extracted text.
+  * Edit number, type, text, options; move/resize, add, delete, split
+    (drag a red line), merge (same number).
+  * ⚠ warnings with explanations for duplicate numbers, skipped
+    numbers, and a first block that continues an earlier page (two more
+    warnings added in session 2).
+  * Continuation logic (lib/review.ts): an unnumbered block at the top
+    of the right column joins the left column's last question (same
+    page). Only the page's first block can continue an earlier page; it
+    is pre-filled from the immediately previous page in the section if
+    that page's last question was marked continues_to_next.
+  * Pinch-zoom via components/ZoomPane.tsx (@use-gesture/react).
+  * Unsaved edits kept in localStorage (old Phase 1 drafts still load).
+  * Shows "Reading…" / failure + Try again; fills in boxes when the AI
+    finishes unless you already drew some. NOTE: it loads boxes as soon
+    as pages.ai_result is non-null, whatever the status — which is why
+    partial progress lives in ai_progress, not ai_result (3.4).
+  * Hidden debug: add ?debug to the URL to show raw (dashed) boxes.
+- Settings (app/(app)/settings/page.tsx + components/SettingsClient.tsx,
+  gear icon on Home): both model IDs (session 2), Test Groq connection,
+  snapping on/off (lib/settings.ts, stored on the phone; only changes
+  which boxes a newly opened page starts from).
+- lib/delete.ts: deleting a page/section/chapter/subject also removes
+  flattened copies from Storage.
+
+2.5 Other files
+---------------
+- vitest.config.mts: new, so tests can resolve the @/ import alias.
+- package.json: added @use-gesture/react.
+- .env.example: SUPABASE_SERVICE_ROLE_KEY, and (session 2) GEMINI_API_KEY
+  and GEMINI_LAYOUT_MODEL.
+- README.md: Phase 2 setup and test checklist (updated in session 2).
+
+2.6 Choices that differ from the approved plan
+----------------------------------------------
+- Continuation lookup uses only the immediately previous page (per the
+  spec), not the plan's scan of the last 20 pages.
+- Same-page column continuation joins by number (not in the plan).
+- Save route crops from the flattened copy (not in the plan; needed for
+  correct crops).
+- Segment route won't overwrite a page saved by hand (not in the plan).
+- Session 2: the single Groq model was replaced by Gemini (layout) +
+  Groq (reading), see 3.3.
+
+========================================================================
+3. SESSION 2 WORK (getting it running + accuracy)
+========================================================================
+
+3.1 Setup problems found running the app for real
+-------------------------------------------------
+- "supabaseKey is required": SUPABASE_SERVICE_ROLE_KEY was empty in
+  .env.local. User filled it in. lib/supabase/service.ts now throws a
+  clear "SUPABASE_SERVICE_ROLE_KEY is not set … restart the dev server"
+  instead of the Supabase library's message.
+- Hot retry loop: any failure before the page was claimed left it
+  'queued', and lib/queue/runner.ts retried every 250ms forever (20+
+  requests in a few seconds). The runner now backs off on a non-OK
+  response or network error: 2s, 4s, 8s … up to 60s. A 409 (someone
+  else claimed the page) counts as OK.
+- "column pages.retry_count does not exist": the Phase 2 migration had
+  never been run. Applied with `supabase db push` (CLI is linked).
+- "violates check constraint pages_check1": that constraint is
+  (status = 'rate_limited') = (retry_after is not null). The claim set
+  status 'processing' but left retry_after set, so every page that had
+  been rate-limited once failed on retry. The claim now also sets
+  retry_after = null.
+- Same bug on manual Save: save_page_questions() set status 'saved'
+  without clearing retry_after, so saving a rate-limited page by hand
+  failed. Fixed in migration 20261005000100 (3.6).
+
+3.2 Accuracy problem: what was tested (scripts in the session
+     scratchpad, not the repo; test page = a 2-column GATE "Array" page)
+----------------------------------------------------------------------
+Symptom: boxes in the wrong place, Q4 missing its options (b)–(d),
+Q3's last lines and options outside every box, Q1's text mixed with Q2's.
+Findings, all on the same page:
+- Groq qwen/qwen3.8-27b, bbox 0-1 (old prompt): coordinates are round
+  guesses (0.05, 0.15, 0.42, 0.78…). Text also mixed between questions.
+- Same model, 0-1000 integer coordinates: slightly better, still
+  guesses (100, 60, 480, 150…); still clipped Q3's (d) and Q5's end.
+- Same model, grounding-only prompt in Qwen's native bbox_2d format:
+  invented output (8 "question numbers" exactly 122 units apart).
+  Conclusion: this model cannot localise; no prompt fixes it.
+- Groq free tier limit: 1,000 OUTPUT tokens per minute for this model.
+  One full-page reply was ~1,500 tokens. Groq rejects a request whose
+  EXPECTED output is too large ("Request too large", HTTP 429); when
+  max_completion_tokens is not set it seems to estimate from recent
+  usage. Setting max_completion_tokens explicitly avoids that.
+- Free-API options looked at: Gemini (AI Studio free tier, chosen),
+  OCR.space (word boxes only), OpenRouter free models (50 req/day),
+  Google Cloud Vision / Azure (need a card). Local Tesseract.js was the
+  fallback plan if Gemini's boxes had been bad.
+- Gemini models available to this key: gemini-2.5-flash is NOT
+  available to new users; 3.5/3.7/3.8-flash and flash-latest exist.
+  The free tier returned 503 "high demand" on most models for 5+
+  minutes at a time.
+- Gemini asked for full text: finishReason RECITATION (refuses to copy
+  copyrighted book text). So Gemini can never be used for the text.
+- Gemini 3.5 Flash, layout only (box_2d [ymin, xmin, ymax, xmax]
+  0-1000, no text): all 5 boxes essentially right, including Q3/Q4/Q5
+  with all options and the marks line; numbers, columns, types and
+  option counts (4,0,4,4,0) all right. ~400 output tokens, ~16s.
+
+3.3 Decision
+------------
+Split the work: Gemini only locates questions; Groq's Qwen reads each
+question from its own crop (one question per call, small capped output,
+fits the 1,000/min budget, can't mix questions together).
+
+3.4 Two-stage pipeline (code)
+-----------------------------
+- lib/ai.ts (rewritten; still the only file that talks to AI providers,
+  plain fetch, no SDKs):
+  * locateQuestions(pageJpeg) -> Gemini generateContent, JSON mode,
+    temperature 0. Converts box_2d to our [x0, y0, x1, y1] 0-1 bbox.
+    429 -> rate_limited using Gemini's error.details[].retryDelay
+    ("31s"). 503 -> rate_limited with no delay (route backs off) —
+    no quick retries, since the overload lasts minutes. No content
+    (e.g. RECITATION) -> treated as invalid -> one retry with the
+    reason -> failed.
+  * readQuestion(cropJpeg, {number, optionCount}) -> Groq chat
+    completions, JSON mode, temperature 0, max_completion_tokens 700.
+    finish_reason "length" -> invalid (one retry). 429 -> rate_limited
+    with Groq's retry-after header.
+  * Shared retry rules (withRetries): network/other 5xx -> 2 quick
+    retries (0.5s, 1.5s); invalid JSON/schema -> 1 retry told the error.
+  * layoutModelName() / readModelName(): env with defaults
+    gemini-3.5-flash and qwen/qwen3.8-27b. Logs event "ai_call" with
+    stage, model, latency, tokens.
+- lib/prompts/segment.ts: LAYOUT_SYSTEM_PROMPT (positions, numbers,
+  columns, types, option_count, diagram/continuation flags — explicitly
+  no text), READ_SYSTEM_PROMPT (transcribe ONE question from a crop,
+  ignore slivers of neighbours, keep the marks line, options without
+  (a)/(b) labels), readUserPrompt(number, optionCount) (passes Gemini's
+  option count as a hint).
+- lib/segment/schema.ts: LayoutResponseSchema (Gemini), ReadResponseSchema
+  (Groq), LocatedQuestion, QuestionFlags (+ unread, options_mismatch),
+  AiQuestion / AiResult (stored, same shape as before plus option_count),
+  AiProgress (partial state; text === null means not read yet).
+- lib/segment/crop.ts (new): cropForReading(page, box) -> JPEG of one
+  question from the full-resolution page, long edge <= 1600px.
+- lib/segment/cleanup.ts: now takes LocatedQuestion[] (no text).
+- app/api/pages/[pageId]/segment/route.ts (reworked):
+  1. Claim as before (now also clears retry_after, selects ai_progress).
+  2. If ai_progress is empty: page -> JPEG (long edge 2000) ->
+     locateQuestions -> cleanup -> snapBoxes on the full page ->
+     progress object with every question unread.
+  3. Read each unread question in order: crop -> readQuestion.
+     - Groq rate-limited: save ai_progress, status rate_limited with
+       retry_after, return. The next attempt skips Gemini and resumes.
+     - Read failed: keep the box, text "" and flag unread; continue.
+     - mcq/msq whose option count differs from Gemini's: flag
+       options_mismatch. Non-choice types drop options.
+     - After 40s (READ_BUDGET_MS, under maxDuration 60): save
+       ai_progress, status 'queued', return; the runner picks it up again.
+  4. All read: write ai_result, ai_model "gemini-… + qwen/…", clear
+     ai_progress, status needs_review, retry_count 0.
+  Layout failed / crash -> status failed, ai_progress cleared.
+- Review UI: two new ⚠ warnings — "couldn't read this question's text"
+  and "number of options read doesn't match what's printed". Editing the
+  text or options clears them. isFlagged() moved into BoxEditor.tsx and
+  is shared by the review page. lib/review.ts maps the new flags.
+- Settings shows both models (finds questions: Gemini; reads text: Groq).
+- .env.example, README.md (setup, test checklist, "How things fit
+  together") updated for Gemini, the two stages and resuming.
+- .env.local: user added GEMINI_API_KEY (set, 53 chars). GEMINI_LAYOUT_MODEL
+  is not set there, so the default gemini-3.5-flash is used.
+
+3.5 Snapping changes (lib/snap.ts)
+----------------------------------
+- fillColumnGaps(): after overlaps are resolved, each box in a column is
+  extended down to the next box's top, so nothing between two questions
+  is lost (it goes to the question above).
+- findNearestGap(): edges and overlap splits now go to the whitespace
+  run NEAREST the model's edge (an edge already in whitespace stays in
+  its own run), instead of the WIDEST run within ±3%. The old rule
+  moved Gemini's correct Q4/Q5 boundary above Q4's marks line. The
+  widest-run finder is still used for the column gutter.
+- Known limit: on a tilted, un-flattened photo, a marks line that
+  nearly touches the next question's first line has no clean gap, so
+  the boundary cuts through it (seen on Q1/Q2 and Q2/Q3 of the test
+  page). Flatten fixes the tilt; the save route's 2% crop padding covers
+  the half line.
+
+3.6 Database (all applied to the real project with `supabase db push`;
+     dry run afterwards says "Remote database is up to date")
+-----------------------------------------------------------------------
+- 20261005000000_phase2_ai_queue.sql (from session 1).
+- 20261005000100_ai_progress.sql (new): adds pages.ai_progress jsonb;
+  replaces save_page_questions() so saving also clears retry_after
+  (body otherwise identical). Rollback notes at the end.
+- 20261005000200_theory_type_tags.sql (new): trigger
+  questions_tag_theory_type sets is_theory = true whenever a question
+  is inserted as, or changed to, type 'theory'; backfills existing
+  theory-type questions. The tag can still be removed by hand.
+  Why: "type = theory" (answer format) and the theory tag (book icon)
+  are separate, and Theory revision plus the library/Practice "Theory"
+  filters only look at the tag — so theory-type questions showed up
+  nowhere. The question page also sets is_theory in its optimistic
+  update when switching to theory, so the icon fills in at once.
+
+========================================================================
+4. WHAT IS TESTED
+========================================================================
+
+4.1 Automated checks
+--------------------
+- npx tsc --noEmit: no errors (after all session 2 changes).
+- npm test: 87 tests in 9 files, all pass. Gemini, Groq and Supabase
+  are mocked; no keys needed.
+    route.test.ts 10, ai.test.ts 10, snap.test.ts 15, review.test.ts 13,
+    number.test.ts 14, grading.test.ts 7, cleanup.test.ts 7,
+    schema.test.ts 7, runner.test.ts 4.
+  Session 2 tests cover: runner backs off after a 500; Gemini box_2d
+  conversion, RECITATION retry, retryDelay parsing, 503 -> rate_limited
+  without quick retries; Groq token cap and option hint sent, cut-off
+  reply retried, retry-after header; route claim clears retry_after,
+  layout rate-limited/failed, full success (text, options, numerical
+  drops options, ai_progress cleared, model string), rate limit
+  part-way saves progress and no ai_result, resume skips Gemini,
+  unread and options_mismatch flags; fillColumnGaps; findNearestGap.
+- npm run build: passes (re-run at the end of session 2).
+
+4.2 Migration smoke test (session 1)
+------------------------------------
+All session 1 migrations ran on a fresh in-process Postgres (PGlite)
+with stand-ins for Supabase auth/storage; 14 checks passed (columns,
+defaults, rate_limited/retry_after constraint, text/options on insert,
+append keeps hand-typed text, append_target_missing).
+
+4.3 Real runs (session 2)
+-------------------------
+- All 3 migrations applied to the real Supabase project.
+- Real dev server against the real project: pages get claimed, the
+  service-role client works, Gemini layout runs, Qwen reads, rate limits
+  save progress and the next request resumes (seen in the user's logs:
+  a 30.8s request, then a 4.2s resume that read one more question
+  before Groq rate-limited again).
+- Full pipeline run by script on the test page with real Gemini + Groq:
+  all 5 questions found; all text and options complete (Q4 (a)–(d),
+  Q3 code + 4 options, Q2/Q5 numerical with no options). Groq
+  rate-limited after every ~2 reads (~20s waits), so a 5-question page
+  takes ~1.5–2 min on the free tier.
+- User confirmed in the app: question mapping works.
+
+========================================================================
+5. WHAT IS NOT TESTED
+========================================================================
+- A page finishing all the way to needs_review inside the real app after
+  the session 2 changes (the user's logs stopped mid-page; the scripted
+  run did finish).
+- The two new review warnings and their clearing, in a browser.
+- The theory tag trigger in the app after applying (user hasn't
+  reported back): reload library with the Theory filter, Theory
+  revision, Practice with Theory selected.
+- The snapping change (nearest gap) on more than the one test page.
+- Gemini accuracy on other books, single-column pages, diagrams,
+  questions continuing across columns/pages.
+- The 40s read budget path (only covered by reasoning, not a test).
+- OpenCV corner detection / Flatten, touch gestures, camera photos,
+  HEIC, rotation — as in session 1.
+- Two tabs processing the queue; RLS / user_id isolation with a second
+  account.
+
+========================================================================
+6. KNOWN LIMITS / POSSIBLE NEXT STEPS
+========================================================================
+- Throughput is set by Groq's free-tier 1,000 output tokens/min
+  (~1 page every 1.5–2 min). Groq's Dev tier removes it.
+- Gemini's free tier is often overloaded (503); pages just wait and
+  retry. Free-tier input may be used by Google to improve its products.
+- Queue runner idles 20s when nothing is claimable, so each rate-limit
+  wait can stretch by up to 20s past retry_after. Could wake the runner
+  at the earliest retry_after instead (small change in runner.ts).
+- No "Test Gemini connection" button in Settings yet.
+- Pages read by the old one-call pipeline keep their old boxes until
+  re-queued.
+- Qwen sometimes leaves out the marks line when it sits below the
+  options (seen on Q4 when the box excluded it).
+
+========================================================================
+7. BEFORE COMMITTING
+========================================================================
+- Sessions 1 and 2 were committed and pushed to main at the end of
+  session 2.
+- .env.local holds real keys (Supabase service role, Groq, Gemini) —
+  keep it out of git. Set the same vars on Vercel if deployed:
+  GEMINI_API_KEY, GEMINI_LAYOUT_MODEL (optional), GROQ_API_KEY,
+  GROQ_VISION_MODEL, SUPABASE_SERVICE_ROLE_KEY.
+- package-lock.json was regenerated in session 1 (earlier uncommitted
+  changes to it were lost then).
+- public/opencv/opencv.js adds 13 MB to the repo.
+
+========================================================================
+8. HOW TO RUN CHECKS
+========================================================================
+  npm install
+  npx tsc --noEmit     (or npm run typecheck)
+  npm test
+  npm run build
+  npm run dev          (http://localhost:3000)
+  npx supabase db push --dry-run   (shows migrations not yet applied)

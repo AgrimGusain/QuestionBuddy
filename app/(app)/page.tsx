@@ -1,6 +1,6 @@
 "use client";
 
-import { Camera, LogOut, NotebookPen, Target } from "lucide-react";
+import { Camera, LogOut, NotebookPen, Settings, Target } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -50,15 +50,20 @@ export default function HomePage() {
     router.refresh();
   }
 
-  const signOutButton = (
-    <button type="button" className="btn-icon" aria-label="Sign out" onClick={signOut}>
-      <LogOut size={20} aria-hidden />
-    </button>
+  const headerActions = (
+    <div className="flex gap-1">
+      <Link href="/settings" className="btn-icon" aria-label="Settings">
+        <Settings size={20} aria-hidden />
+      </Link>
+      <button type="button" className="btn-icon" aria-label="Sign out" onClick={signOut}>
+        <LogOut size={20} aria-hidden />
+      </button>
+    </div>
   );
 
   return (
     <>
-      <TopBar title="Snap Question Bank" right={signOutButton} />
+      <TopBar title="Snap Question Bank" right={headerActions} />
       <main className="space-y-6 px-4 py-4">
         {error && <ErrorNote>{error}</ErrorNote>}
         {!h || !rows ? (

@@ -21,9 +21,12 @@ export async function deleteWithFiles(scope: DeleteScope): Promise<void> {
   const pages: string[] = [];
 
   if ("pageId" in scope) {
-    const { data, error } = await db.from("pages").select("original_path").eq("id", scope.pageId).maybeSingle();
+    const { data, error } = await db.from("pages").select("original_path, processed_path").eq("id", scope.pageId).maybeSingle();
     if (error) throw new Error(error.message);
-    if (data) pages.push(data.original_path as string);
+    if (data) {
+      pages.push(data.original_path as string);
+      if (data.processed_path) pages.push(data.processed_path as string);
+    }
     const del = await db.from("pages").delete().eq("id", scope.pageId);
     if (del.error) throw new Error(del.error.message);
     await removeObjects("pages", pages);
@@ -56,13 +59,16 @@ export async function deleteWithFiles(scope: DeleteScope): Promise<void> {
       if (error) throw new Error(error.message);
       chapterIds = (data ?? []).map((c) => c.id as string);
     }
-    const rows = await fetchAll<{ original_path: string }>((from, to) => {
-      const q = db.from("pages").select("original_path").range(from, to);
+    const rows = await fetchAll<{ original_path: string; processed_path: string | null }>((from, to) => {
+      const q = db.from("pages").select("original_path, processed_path").range(from, to);
       if ("sectionId" in scope) return q.eq("section_id", scope.sectionId);
       if ("chapterId" in scope) return q.eq("chapter_id", scope.chapterId);
       return q.in("chapter_id", chapterIds.length ? chapterIds : ["00000000-0000-0000-0000-000000000000"]);
     });
-    pages.push(...rows.map((r) => r.original_path));
+    for (const r of rows) {
+      pages.push(r.original_path);
+      if (r.processed_path) pages.push(r.processed_path);
+    }
   }
 
   const table = "subjectId" in scope ? "subjects"

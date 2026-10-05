@@ -1,21 +1,29 @@
 "use client";
 
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, RotateCw, Scissors, Trash2, TriangleAlert, X } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
-import { BoxEditor, partOf, type DraftBox } from "@/components/BoxEditor";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { BoxEditor, isFlagged, partOf, type DraftBox } from "@/components/BoxEditor";
 import { ErrorNote, Loading } from "@/components/Status";
 import { TopBar } from "@/components/TopBar";
 import { useSignedUrls } from "@/components/useSignedUrls";
+import { ZoomPane } from "@/components/ZoomPane";
 import { deleteWithFiles } from "@/lib/delete";
 import { loadHierarchy, pathLabel, type Hierarchy } from "@/lib/hierarchy";
 import { nextQuestionNumber, normalizeQuestionNumber } from "@/lib/number";
+import { wakeQueueRunner } from "@/lib/queue/runner";
+import { boxesFromAi, continuationTarget, mergedOptions, mergedText, splitBox } from "@/lib/review";
+import { getSnapDisplay } from "@/lib/settings";
 import { supabase } from "@/lib/supabase/client";
-import { TYPE_SHORT, type PageRow, type QuestionType } from "@/lib/types";
+import { OPTION_LETTERS, TYPE_SHORT, type AiResult, type PageRow, type QuestionType } from "@/lib/types";
 import { uuid } from "@/lib/uuid";
 
 const draftKey = (pageId: string) => `sqb:draft:${pageId}`;
+const AI_PENDING: PageRow["status"][] = ["queued", "processing", "rate_limited"];
+const POLL_MS = 4000;
+const MAX_OPTIONS = 8;
+const isChoice = (t: QuestionType) => t === "mcq" || t === "msq";
 
 interface Group {
   number: string;
@@ -40,7 +48,7 @@ function groupBoxes(boxes: DraftBox[]): Group[] {
 function newBox(boxes: DraftBox[]): DraftBox {
   const last = boxes[boxes.length - 1];
   if (!last) {
-    return { id: uuid(), x0: 0.04, y0: 0.05, x1: 0.96, y1: 0.18, number: "1", type: "mcq", append: false };
+    return { id: uuid(), x0: 0.04, y0: 0.05, x1: 0.96, y1: 0.18, number: "1", type: "mcq", append: false, text: "", options: null };
   }
   const h = Math.min(0.13, Math.max(0.05, last.y1 - last.y0));
   let { x0, x1 } = last;
@@ -62,7 +70,47 @@ function newBox(boxes: DraftBox[]): DraftBox {
     number: nextQuestionNumber(last.number),
     type: last.type,
     append: false,
+    text: "",
+    options: null,
   };
+}
+
+function readDraft(pageId: string): DraftBox[] | null {
+  try {
+    const raw = localStorage.getItem(draftKey(pageId));
+    if (!raw) return null;
+    // Older (Phase 1) drafts have no text/options.
+    return (JSON.parse(raw) as Partial<DraftBox>[]).map((b) => ({ ...b, text: b.text ?? "", options: b.options ?? null }) as DraftBox);
+  } catch {
+    return null; // Ignore a corrupt draft.
+  }
+}
+
+/** The model's boxes, with a first block that continues an earlier page pointed at that page's last question. */
+async function initialBoxes(page: PageRow): Promise<DraftBox[]> {
+  if (!page.ai_result) return [];
+  const boxes = boxesFromAi(page.ai_result, getSnapDisplay());
+  const first = boxes[0];
+  if (first?.flags?.continuesFromPrevious && page.section_id) {
+    const prev = await supabase()
+      .from("pages")
+      .select("ai_result")
+      .eq("section_id", page.section_id)
+      .eq("kind", "questions")
+      .neq("id", page.id)
+      .lt("created_at", page.created_at)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const target = continuationTarget((prev.data as { ai_result: AiResult | null } | null) ?? null);
+    if (target) boxes[0] = { ...first, number: target, append: true };
+  }
+  return boxes;
+}
+
+function cleanOptions(options: string[] | null): string[] | null {
+  const cleaned = (options ?? []).map((o) => o.trim().slice(0, 500)).filter(Boolean).slice(0, MAX_OPTIONS);
+  return cleaned.length ? cleaned : null;
 }
 
 const SAVE_ERRORS: Record<string, (numbers: string[], section: string) => string> = {
@@ -77,7 +125,55 @@ const SAVE_ERRORS: Record<string, (numbers: string[], section: string) => string
   crop_upload_failed: () => "Uploading the question images failed. Check your connection and save again.",
 };
 
-export default function MarkBoxesPage() {
+/** A box's region of the page, cut out with CSS (no extra download), at most 320px tall. */
+function CropPreview({ imageUrl, size, box }: { imageUrl: string; size: { w: number; h: number }; box: DraftBox }) {
+  const w = box.x1 - box.x0;
+  const h = box.y1 - box.y0;
+  const aspect = (w * size.w) / (h * size.h);
+  const pos = (start: number, span: number) => (span >= 0.999 ? 0 : (start / (1 - span)) * 100);
+  return (
+    <div
+      aria-hidden
+      className="rounded-lg border border-line bg-white"
+      style={{
+        width: `min(100%, ${Math.round(320 * aspect)}px)`,
+        aspectRatio: `${aspect}`,
+        backgroundImage: `url("${imageUrl}")`,
+        backgroundSize: `${100 / w}% ${100 / h}%`,
+        backgroundPosition: `${pos(box.x0, w)}% ${pos(box.y0, h)}%`,
+        backgroundRepeat: "no-repeat",
+      }}
+    />
+  );
+}
+
+function OptionsEditor({ options, onChange }: { options: string[]; onChange: (o: string[]) => void }) {
+  return (
+    <div className="space-y-2">
+      {options.map((o, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <span className="w-5 shrink-0 text-center text-sm font-bold text-muted">{OPTION_LETTERS[i] ?? i + 1}</span>
+          <input
+            className="field"
+            aria-label={`Option ${i + 1}`}
+            value={o}
+            onChange={(e) => onChange(options.map((x, j) => (j === i ? e.target.value : x)))}
+          />
+          <button type="button" className="btn-icon shrink-0" aria-label={`Remove option ${i + 1}`} onClick={() => onChange(options.filter((_, j) => j !== i))}>
+            <X size={16} aria-hidden />
+          </button>
+        </div>
+      ))}
+      {options.length < MAX_OPTIONS && (
+        <button type="button" className="chip" onClick={() => onChange([...options, ""])}>
+          <Plus size={14} aria-hidden /> Option
+        </button>
+      )}
+    </div>
+  );
+}
+
+export default function ReviewPage() {
   const { pageId } = useParams<{ pageId: string }>();
   const router = useRouter();
   const [page, setPage] = useState<PageRow | null>(null);
@@ -89,23 +185,62 @@ export default function MarkBoxesPage() {
   const [error, setError] = useState<string | null>(null);
   const [savedCount, setSavedCount] = useState<number | null>(null);
   const [nextPage, setNextPage] = useState<string | null>(null);
+  const [splitting, setSplitting] = useState<{ boxId: string; t: number } | null>(null);
+  const [imgSize, setImgSize] = useState<{ w: number; h: number } | null>(null);
+  const [debug, setDebug] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
+  // Set once boxes have come from a draft or the model, so a late AI result never replaces them.
+  const populated = useRef(false);
+
+  // Hidden debug toggle: open the page with ?debug to compare raw and snapped boxes.
+  useEffect(() => {
+    setDebug(new URLSearchParams(window.location.search).has("debug"));
+  }, []);
 
   useEffect(() => {
+    let live = true;
     Promise.all([supabase().from("pages").select("*").eq("id", pageId).maybeSingle(), loadHierarchy()])
-      .then(([res, hier]) => {
+      .then(async ([res, hier]) => {
         if (res.error) throw new Error(res.error.message);
-        setPage(res.data as PageRow | null);
+        const p = res.data as PageRow | null;
+        if (!live) return;
+        setPage(p);
         setH(hier);
-        try {
-          const draft = localStorage.getItem(draftKey(pageId));
-          if (draft) setBoxes(JSON.parse(draft));
-        } catch {
-          // Ignore a corrupt draft.
+        const draft = readDraft(pageId);
+        if (draft) {
+          populated.current = true;
+          setBoxes(draft);
+        } else if (p?.ai_result) {
+          populated.current = true;
+          const initial = await initialBoxes(p);
+          if (live) setBoxes(initial);
         }
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoaded(true));
+      .catch((e) => live && setError(e.message))
+      .finally(() => live && setLoaded(true));
+    return () => {
+      live = false;
+    };
   }, [pageId]);
+
+  // While the model is still reading this page, check back for its result.
+  const aiPending = !!page && AI_PENDING.includes(page.status);
+  useEffect(() => {
+    if (!aiPending) return;
+    const id = setInterval(async () => {
+      const res = await supabase().from("pages").select("*").eq("id", pageId).maybeSingle();
+      if (res.data) setPage(res.data as PageRow);
+    }, POLL_MS);
+    return () => clearInterval(id);
+  }, [aiPending, pageId]);
+
+  // Fill in the model's boxes when it finishes — unless boxes were already drawn by hand meanwhile.
+  useEffect(() => {
+    if (!loaded || !page?.ai_result || populated.current) return;
+    populated.current = true;
+    if (boxes.length) return;
+    initialBoxes(page).then((b) => setBoxes((current) => (current.length ? current : b)));
+  }, [loaded, page, boxes.length]);
 
   // Keep a local draft so leaving the screen doesn't lose the boxes.
   useEffect(() => {
@@ -118,10 +253,21 @@ export default function MarkBoxesPage() {
     }
   }, [boxes, loaded, pageId, savedCount]);
 
-  const urls = useSignedUrls("pages", page ? [page.original_path] : []);
-  const imageUrl = page ? urls[page.original_path] : undefined;
+  // The boxes are positioned on the flattened copy when there is one.
+  const imagePath = page ? (page.processed_path ?? page.original_path) : null;
+  const urls = useSignedUrls("pages", imagePath ? [imagePath] : []);
+  const imageUrl = imagePath ? urls[imagePath] : undefined;
+
+  useEffect(() => {
+    if (!imageUrl) return;
+    const img = new Image();
+    img.onload = () => setImgSize({ w: img.naturalWidth, h: img.naturalHeight });
+    img.src = imageUrl;
+  }, [imageUrl]);
+
   const groups = useMemo(() => groupBoxes(boxes), [boxes]);
   const selected = boxes.find((b) => b.id === selectedId) ?? null;
+  const flaggedCount = boxes.filter(isFlagged).length;
   const sectionName = (h && page?.section_id && h.sections.find((s) => s.id === page.section_id)?.name) || "this section";
 
   function edit(id: string, patch: Partial<DraftBox>) {
@@ -131,7 +277,14 @@ export default function MarkBoxesPage() {
       // Type and "continues" belong to the whole question: apply to every part.
       const key = normalizeQuestionNumber(target.number);
       return list.map((b) => {
-        if (b.id === id) return { ...b, ...patch };
+        if (b.id === id) {
+          // Editing the number answers the model's duplicate/gap warning;
+          // editing the text or options answers its reading warning.
+          let flags = b.flags;
+          if (flags && "number" in patch) flags = { ...flags, duplicateNumber: false, sequenceGap: false };
+          if (flags && ("text" in patch || "options" in patch)) flags = { ...flags, unread: false, optionsMismatch: false };
+          return { ...b, ...patch, flags };
+        }
         if (normalizeQuestionNumber(b.number) === key && ("type" in patch || "append" in patch)) {
           return { ...b, ...("type" in patch ? { type: patch.type! } : {}), ...("append" in patch ? { append: patch.append! } : {}) };
         }
@@ -144,6 +297,23 @@ export default function MarkBoxesPage() {
     const b = newBox(boxes);
     setBoxes((list) => [...list, b]);
     setSelectedId(b.id);
+  }
+
+  function confirmSplit() {
+    if (!splitting) return;
+    const next = splitBox(boxes, splitting.boxId, splitting.t);
+    const idx = next.findIndex((b) => b.id === splitting.boxId);
+    setBoxes(next);
+    setSelectedId(next[idx + 1]?.id ?? null); // the new bottom half needs its number typed
+    setSplitting(null);
+  }
+
+  async function retryAi() {
+    setError(null);
+    const res = await supabase().from("pages").update({ status: "queued", error: null, retry_after: null, retry_count: 0 }).eq("id", pageId);
+    if (res.error) return setError(res.error.message);
+    wakeQueueRunner();
+    setPage((p) => (p ? { ...p, status: "queued", error: null } : p));
   }
 
   async function save() {
@@ -163,6 +333,8 @@ export default function MarkBoxesPage() {
           type: g.type,
           append: g.append,
           boxes: g.boxes.map(({ x0, y0, x1, y1 }) => ({ x0, y0, x1, y1 })),
+          text: mergedText(g.boxes).slice(0, 4000),
+          options: isChoice(g.type) ? cleanOptions(mergedOptions(g.boxes)) : null,
         })),
       }),
     }).catch(() => null);
@@ -209,7 +381,7 @@ export default function MarkBoxesPage() {
   if (!page) {
     return (
       <>
-        <TopBar title="Mark questions" back="/upload" />
+        <TopBar title="Review questions" back="/upload" />
         <main className="px-4 py-4">
           <ErrorNote>{error ?? "This page no longer exists."}</ErrorNote>
         </main>
@@ -233,7 +405,7 @@ export default function MarkBoxesPage() {
           </p>
           {nextPage && (
             <Link href={`/upload/${nextPage}`} className="btn-primary w-full">
-              Mark the next page
+              Review the next page
             </Link>
           )}
           <Link href={libraryHref} className={`${nextPage ? "btn-secondary" : "btn-primary"} w-full`}>
@@ -252,7 +424,7 @@ export default function MarkBoxesPage() {
   return (
     <>
       <TopBar
-        title="Mark questions"
+        title="Review questions"
         subtitle={h ? pathLabel(h, page.chapter_id, page.section_id) : undefined}
         back="/upload"
         right={
@@ -262,16 +434,86 @@ export default function MarkBoxesPage() {
         }
       />
       <main className="space-y-3 py-3">
+        {aiPending && (
+          <p className="mx-4 flex items-center gap-2 rounded-xl bg-sunken px-3 py-2 text-sm text-muted" role="status">
+            Reading this page… the boxes appear here when it&apos;s done. You can also draw them yourself now.
+          </p>
+        )}
+        {page.status === "failed" && (
+          <div className="mx-4 space-y-2 rounded-xl border border-bad/40 bg-bad/10 px-3 py-2 text-sm text-bad" role="alert">
+            <p>Couldn&apos;t read this page automatically{page.error ? ` (${page.error})` : ""}. Draw the boxes yourself, or try again.</p>
+            <button type="button" className="chip" onClick={retryAi}>
+              <RotateCw size={14} aria-hidden /> Try again
+            </button>
+          </div>
+        )}
+        {flaggedCount > 0 && (
+          <p className="mx-4 flex items-center gap-2 text-sm text-bad">
+            <TriangleAlert size={16} className="shrink-0" aria-hidden />
+            Check the {flaggedCount === 1 ? "box" : `${flaggedCount} boxes`} marked ⚠ — tap one to see why.
+          </p>
+        )}
         <p className="px-4 text-sm text-muted">
-          Add a box for each question, then tap a box to move it, resize it or change its number. Give two boxes the
-          same number to join them into one question.
+          Tap a box to move it, resize it, split it, or fix its number, text and options. Boxes with the same number join into one
+          question. Pinch to zoom.
         </p>
+        {debug && (
+          <label className="mx-4 flex items-center gap-2 text-sm">
+            <input type="checkbox" className="size-5 accent-[var(--accent)]" checked={showRaw} onChange={(e) => setShowRaw(e.target.checked)} />
+            Show the model&apos;s raw boxes (dashed)
+          </label>
+        )}
+
         {imageUrl ? (
-          <BoxEditor imageUrl={imageUrl} boxes={boxes} selectedId={selectedId} onSelect={setSelectedId} onChange={setBoxes} />
+          <ZoomPane>
+            <BoxEditor
+              imageUrl={imageUrl}
+              boxes={boxes}
+              selectedId={selectedId}
+              onSelect={(id) => !splitting && setSelectedId(id)}
+              onChange={setBoxes}
+              splitBoxId={splitting?.boxId ?? null}
+              splitT={splitting?.t}
+              onSplitDrag={(t) => setSplitting((s) => (s ? { ...s, t } : s))}
+              showRaw={showRaw}
+            />
+          </ZoomPane>
         ) : (
           <div className="mx-4 h-96 animate-pulse rounded-xl bg-sunken" />
         )}
-        <div className="h-56" aria-hidden />
+
+        {groups.length > 0 && imageUrl && imgSize && (
+          <section className="space-y-2 px-4 pt-2">
+            <h2 className="font-bold">Questions on this page</h2>
+            <ul className="space-y-3">
+              {groups.map((g) => {
+                const text = mergedText(g.boxes);
+                const flagged = g.boxes.some(isFlagged);
+                return (
+                  <li key={g.boxes[0].id}>
+                    <button
+                      type="button"
+                      className={`card w-full space-y-2 p-3 text-left ${g.boxes.some((b) => b.id === selectedId) ? "border-accent" : ""}`}
+                      onClick={() => !splitting && setSelectedId(g.boxes[0].id)}
+                    >
+                      <span className="flex items-center gap-2 font-bold">
+                        {flagged && <TriangleAlert size={16} className="shrink-0 text-bad" aria-label="Needs checking" />}
+                        {g.number || "No number"}
+                        <span className="text-sm font-normal text-muted">{TYPE_SHORT[g.type]}</span>
+                        {g.append && <span className="text-sm font-normal text-muted">· continues earlier page</span>}
+                      </span>
+                      {g.boxes.map((b) => (
+                        <CropPreview key={b.id} imageUrl={imageUrl} size={imgSize} box={b} />
+                      ))}
+                      <span className={`block whitespace-pre-wrap text-sm ${text ? "" : "text-muted"}`}>{text || "No text read for this question."}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
+        <div className="h-[55vh]" aria-hidden />
       </main>
 
       {/* Action panel, fixed above the bottom navigation */}
@@ -279,9 +521,21 @@ export default function MarkBoxesPage() {
         className="fixed inset-x-0 z-20 border-t border-line bg-surface"
         style={{ bottom: "calc(4rem + env(safe-area-inset-bottom, 0px))" }}
       >
-        <div className="mx-auto max-w-xl space-y-3 px-4 py-3">
+        <div className="mx-auto max-h-[50vh] max-w-xl space-y-3 overflow-y-auto px-4 py-3">
           {error && <ErrorNote>{error}</ErrorNote>}
-          {selected ? (
+          {splitting ? (
+            <>
+              <p className="text-sm">Drag the red line to where the second question starts.</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button type="button" className="btn-secondary" onClick={() => setSplitting(null)}>
+                  Cancel
+                </button>
+                <button type="button" className="btn-primary" onClick={confirmSplit}>
+                  Split here
+                </button>
+              </div>
+            </>
+          ) : selected ? (
             <>
               <div className="flex items-center gap-2">
                 <label htmlFor="box-number" className="text-sm font-bold text-muted">
@@ -306,6 +560,30 @@ export default function MarkBoxesPage() {
                   <Trash2 size={20} aria-hidden />
                 </button>
               </div>
+
+              {selected.flags?.duplicateNumber && (
+                <p className="text-sm text-bad">
+                  This number was read twice on this page. If it&apos;s one question running across columns, keep the same number;
+                  otherwise fix it.
+                </p>
+              )}
+              {selected.flags?.sequenceGap && (
+                <p className="text-sm text-bad">The number before this one looks skipped — check this number, or whether a question was missed.</p>
+              )}
+              {selected.flags?.unread && (
+                <p className="text-sm text-bad">The model couldn&apos;t read this question&apos;s text. Type it below, or leave it blank.</p>
+              )}
+              {selected.flags?.optionsMismatch && (
+                <p className="text-sm text-bad">The number of options read doesn&apos;t match what&apos;s printed — check the options below.</p>
+              )}
+              {selected.flags?.continuesFromPrevious && (
+                <p className="text-sm text-bad">
+                  {selected.append && selected.number
+                    ? `This looks like the rest of question ${selected.number} from the previous page.`
+                    : "This looks like the rest of a question from an earlier page: type its number and tick “Continues from an earlier page”."}
+                </p>
+              )}
+
               {part === 1 ? (
                 <>
                   <div className="flex gap-2" role="radiogroup" aria-label="Question type">
@@ -335,9 +613,35 @@ export default function MarkBoxesPage() {
               ) : (
                 <p className="text-sm text-muted">Type and settings follow part 1 of this question.</p>
               )}
-              <div className="grid grid-cols-2 gap-2">
+
+              <div className="space-y-1">
+                <label htmlFor="box-text" className="text-sm font-bold text-muted">
+                  Text
+                </label>
+                <textarea
+                  id="box-text"
+                  className="field min-h-24"
+                  value={selected.text}
+                  placeholder={selected.number ? "No text read — type it if you want it searchable." : undefined}
+                  onChange={(e) => edit(selected.id, { text: e.target.value })}
+                />
+                {parts > 1 && <p className="text-xs text-muted">The question keeps the text of its first part that has any.</p>}
+                {selected.append && <p className="text-xs text-muted">Text you typed on the saved question is never replaced.</p>}
+              </div>
+
+              {isChoice(selected.type) && (
+                <div className="space-y-1">
+                  <span className="text-sm font-bold text-muted">Options</span>
+                  <OptionsEditor options={selected.options ?? []} onChange={(o) => edit(selected.id, { options: o })} />
+                </div>
+              )}
+
+              <div className="grid grid-cols-3 gap-2">
+                <button type="button" className="btn-secondary" onClick={() => setSplitting({ boxId: selected.id, t: 0.5 })}>
+                  <Scissors size={18} aria-hidden /> Split
+                </button>
                 <button type="button" className="btn-secondary" onClick={addBox}>
-                  <Plus size={18} aria-hidden /> Next box
+                  <Plus size={18} aria-hidden /> Box
                 </button>
                 <button type="button" className="btn-primary" onClick={() => setSelectedId(null)}>
                   Done

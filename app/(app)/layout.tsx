@@ -1,4 +1,5 @@
 import { BottomNav } from "@/components/BottomNav";
+import { QueueRunner } from "@/components/QueueRunner";
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -7,6 +8,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         {children}
       </div>
       <BottomNav />
+      <QueueRunner />
     </>
   );
 }

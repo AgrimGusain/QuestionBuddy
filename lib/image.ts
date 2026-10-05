@@ -1,5 +1,5 @@
 /** Load any photo the browser can decode, honouring EXIF rotation. */
-async function decode(file: Blob): Promise<{ source: CanvasImageSource; width: number; height: number; close: () => void }> {
+export async function decode(file: Blob): Promise<{ source: CanvasImageSource; width: number; height: number; close: () => void }> {
   try {
     const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
     return { source: bmp, width: bmp.width, height: bmp.height, close: () => bmp.close() };
@@ -29,7 +29,7 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
  * Prepare a camera/gallery photo for storage: upright, JPEG, long edge at
  * most `maxEdge`. This also turns iPhone HEIC into JPEG, which sharp can't read.
  */
-export async function prepareJpeg(file: Blob, maxEdge = 3000, quality = 0.9): Promise<Blob> {
+export async function prepareJpeg(file: Blob, maxEdge = 2400, quality = 0.85): Promise<Blob> {
   const img = await decode(file);
   const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
   const canvas = document.createElement("canvas");

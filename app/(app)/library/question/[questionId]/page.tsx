@@ -130,7 +130,7 @@ export default function QuestionPage() {
           </div>
           <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Question type">
             {(Object.keys(TYPE_LABEL) as QuestionType[]).map((t) => (
-              <button key={t} type="button" role="radio" aria-checked={q.type === t} className="chip" onClick={() => update({ type: t })}>
+              <button key={t} type="button" role="radio" aria-checked={q.type === t} className="chip" onClick={() => update(t === "theory" && q.type !== "theory" ? { type: t, is_theory: true } : { type: t })}>
                 {TYPE_LABEL[t]}
               </button>
             ))}
